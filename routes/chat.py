@@ -237,8 +237,24 @@ def persist_messages(conversation_id: str, user_message: str, assistant_message:
             "role": "assistant",
             "content": assistant_message
         }).execute()
+        print("[CHAT]: Successfully logged to Supabase")
     except Exception as e:
-        print(f"Failed to log chat to Supabase: {e}")
+        print(f"[CHAT]: Failed to log chat to Supabase: {e}")
+        # Fallback to hybrid memory if available
+        try:
+            from services.hybrid_memory import hybrid_memory
+            if hybrid_memory and hybrid_memory.local_conn:
+                hybrid_memory._execute_query(
+                    "INSERT INTO sync_queue (operation_type, table_name, record_id, payload, sync_status) VALUES (%s, %s, %s, %s, 'pending')",
+                    ("insert", "messages", 0, json.dumps({
+                        "conversation_id": conversation_id,
+                        "user_message": user_message,
+                        "assistant_message": assistant_message
+                    }))
+                )
+                print("[CHAT]: Queued for sync in hybrid memory")
+        except Exception as fallback_error:
+            print(f"[CHAT]: Hybrid memory fallback also failed: {fallback_error}")
 
 
 @router.post("/interrupt")

@@ -15,6 +15,7 @@ from routes.logs import router as logs_router
 from routes.conversations import router as conversations_router
 from routes.tools import router as tools_router
 from services.memory import initialize_memory
+from services.hybrid_memory import hybrid_memory, initialize_hybrid_memory
 
 load_dotenv()
 
@@ -71,6 +72,8 @@ def run_startup_speech():
 @app.on_event("startup")
 async def startup_event():
     initialize_memory()
+    # Initialize hybrid memory (local PostgreSQL)
+    await initialize_hybrid_memory()
     # Run in a separate thread so it doesn't block the API engine startup
     threading.Thread(target=run_startup_speech, daemon=True).start()
     threading.Thread(target=warm_ollama_local, daemon=True).start()

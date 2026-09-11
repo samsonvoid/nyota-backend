@@ -8,12 +8,22 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from collections import defaultdict
 
 import psutil
 
+# Import hybrid memory for dynamic learning
+try:
+    from services.hybrid_memory import hybrid_memory
+except ImportError:
+    hybrid_memory = None
 
 DEFAULT_OUTPUT_LIMIT = 12_000
 DEFAULT_TIMEOUT_SECONDS = 30
+MAX_RETRIES = 2  # Maximum retries for same tool failure before asking for help
+
+# Loop detection guard - track recent tool failures
+_recent_failures: dict[str, list[float]] = defaultdict(list)
 
 
 @dataclass(frozen=True)
@@ -140,7 +150,91 @@ def _finish(tool: str, arguments: dict[str, Any], started_at: float, success: bo
         "requires_approval": TOOLS[tool].requires_approval,
     }
     _audit(tool, arguments, result)
+    
+    # Track failures for loop detection
+    failure_key = f"{tool}:{str(arguments)}"
+    now = time.time()
+    
+    if not success:
+        _recent_failures[failure_key].append(now)
+        # Clean up old failures (older than 5 minutes)
+        _recent_failures[failure_key] = [t for t in _recent_failures[failure_key] if now - t < 300]
+        
+        # Record failure in hybrid memory for learning
+        if hybrid_memory and hybrid_memory.local_conn:
+            try:
+                error_msg = output[:500] if output else "Unknown error"
+                # Run in thread to avoid blocking
+                import threading
+                threading.Thread(
+                    target=lambda: hybrid_memory._execute_query(
+                        "INSERT INTO tool_failures (tool_name, error_message, last_seen_at, occurrence_count) VALUES (%s, %s, now(), 1) ON CONFLICT (tool_name, error_message) DO UPDATE SET occurrence_count = tool_failures.occurrence_count + 1, last_seen_at = now()",
+                        (tool, error_msg)
+                    ),
+                    daemon=True
+                ).start()
+            except Exception as e:
+                print(f"[EXECUTOR]: Failed to record failure in hybrid memory: {e}")
+    else:
+        # Clear failures on success
+        if failure_key in _recent_failures:
+            del _recent_failures[failure_key]
+    
     return result
+
+
+def _check_loop_detection(tool: str, arguments: dict[str, Any]) -> tuple[bool, str]:
+    """Check if this tool+arguments combination is in a failure loop"""
+    failure_key = f"{tool}:{str(arguments)}"
+    now = time.time()
+    
+    # Clean up old failures
+    _recent_failures[failure_key] = [t for t in _recent_failures[failure_key] if now - t < 300]
+    
+    recent_count = len(_recent_failures[failure_key])
+    if recent_count >= MAX_RETRIES:
+        return True, f"Samson, nimejaribu kutumia '{tool}' mara {recent_count} bila mafanikio. Unaweza kunielekeza njia sahihi au kunipa maelekezo jinsi ya kufanya hili?"
+    
+    return False, ""
+
+
+def _get_learned_path(app_name: str) -> str | None:
+    """Check hybrid memory for previously learned application path"""
+    if not hybrid_memory or not hybrid_memory.local_conn:
+        return None
+    
+    try:
+        rows = hybrid_memory._execute_query(
+            "SELECT resolved_path FROM learned_paths WHERE app_name = %s ORDER BY confidence_score DESC, last_used_at DESC LIMIT 1",
+            (app_name,)
+        )
+        if rows and rows[0][0]:
+            path = rows[0][0]
+            # Update last_used_at
+            hybrid_memory._execute_query(
+                "UPDATE learned_paths SET last_used_at = now() WHERE app_name = %s AND resolved_path = %s",
+                (app_name, path)
+            )
+            return path
+    except Exception as e:
+        print(f"[EXECUTOR]: Failed to get learned path: {e}")
+    
+    return None
+
+
+def _learn_path(app_name: str, resolved_path: str, confidence: int = 1) -> None:
+    """Store a learned application path in hybrid memory"""
+    if not hybrid_memory or not hybrid_memory.local_conn:
+        return
+    
+    try:
+        hybrid_memory._execute_query(
+            "INSERT INTO learned_paths (app_name, resolved_path, confidence_score, last_used_at) VALUES (%s, %s, %s, now()) ON CONFLICT (app_name, resolved_path) DO UPDATE SET confidence_score = GREATEST(learned_paths.confidence_score, %s), last_used_at = now()",
+            (app_name, resolved_path, confidence, confidence)
+        )
+        print(f"[EXECUTOR]: Learned path for '{app_name}' -> {resolved_path}")
+    except Exception as e:
+        print(f"[EXECUTOR]: Failed to learn path: {e}")
 
 
 def list_files(path: str | None = None, recursive: bool = False, limit: int = 200) -> dict[str, Any]:
@@ -311,6 +405,12 @@ def frontend_build(path: str | None = None) -> dict[str, Any]:
 
 def _find_windows_app(app_name: str) -> str | None:
     """Tafuta executable path kwenye PATH, App Paths za Registry, na Folders kuu za Windows."""
+    # 0. First check hybrid memory for learned path
+    learned_path = _get_learned_path(app_name)
+    if learned_path and os.path.exists(learned_path):
+        print(f"[EXECUTOR]: Using learned path for '{app_name}': {learned_path}")
+        return learned_path
+
     # 1. Jaribu kupata kwenye PATH ya mfumo
     found_path = shutil.which(app_name)
     if found_path:
@@ -408,6 +508,18 @@ def execute_tool(
             "requires_approval": True,
         }
 
+    # Check for loop detection before executing
+    is_looping, loop_message = _check_loop_detection(tool, arguments)
+    if is_looping:
+        return {
+            "success": False,
+            "tool": tool,
+            "output": loop_message,
+            "duration_ms": 0,
+            "requires_approval": TOOLS[tool].requires_approval,
+            "is_loop_detected": True,
+        }
+
     try:
         if tool == "list_files":
             return list_files(**arguments)
@@ -426,7 +538,15 @@ def execute_tool(
         if tool == "frontend_build":
             return frontend_build(**arguments)
         if tool == "launch_app":
-            return launch_app(**arguments)
+            result = launch_app(**arguments)
+            # If successful, learn the path for future use
+            if result["success"] and "target_path" in str(result.get("output", "")):
+                # Extract path from output and learn it
+                import re
+                path_match = re.search(r'[A-Z]:\\[^"]+\.exe', result["output"])
+                if path_match:
+                    _learn_path(arguments.get("app_name", ""), path_match.group(0))
+            return result
     except TypeError as error:
         return {
             "success": False,

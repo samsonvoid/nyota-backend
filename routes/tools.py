@@ -114,7 +114,11 @@ async def approve_tool(approval_id: str, request: Request, _=Depends(validate_ap
         True,
     )
     approval_store.complete(approval, result)
-    return approval.as_dict()
+    
+    # Return approval with tool result included
+    response = approval.as_dict()
+    response["tool_result"] = result
+    return response
 
 
 @router.post("/approvals/{approval_id}/reject")
