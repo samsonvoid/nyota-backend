@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -11,6 +12,7 @@ from typing import Any
 from collections import defaultdict
 
 import psutil
+import winreg
 
 # Import hybrid memory for dynamic learning
 try:
@@ -503,6 +505,113 @@ UWP_APPS: dict[str, str] = {
     "alarm": "ms-clock:",
     "alarms": "ms-clock:",
 }
+
+
+def scan_installed_apps() -> dict[str, list[str]]:
+    """Quick scan for installed apps via registry + PATH. Cached to JSON for speed."""
+    import json, time
+    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    cache_path = os.path.join(base_dir, ".app_discovery_cache.json")
+    cache_age = 3600
+
+    if os.path.exists(cache_path):
+        try:
+            with open(cache_path) as f:
+                cached = json.load(f)
+            if time.time() - cached.get("_timestamp", 0) < cache_age:
+                app_map = {k: v for k, v in cached.items() if k != "_timestamp"}
+                print(f"[APP DISCOVERY]: Loaded {len(app_map)} apps from cache")
+                return app_map
+        except Exception:
+            pass
+
+    app_map: dict[str, list[str]] = {}
+    GARBAGE = lambda k: k.startswith("(") or "x64" in k or len(k) <= 2 or re.match(r"^[0-9][0-9.]*$", k) or "." in k and k.replace(".", "").isdigit()
+
+    def add_app(key: str, exe_path: str):
+        k = key.strip().lower().replace(" ", "").replace("-", "").replace("_", "")
+        if len(k) < 2 or GARBAGE(k):
+            return
+        if k not in app_map or not app_map[k]:
+            app_map.setdefault(k, [])
+            if exe_path not in app_map[k]:
+                app_map[k].append(exe_path)
+
+    if os.name == "nt":
+        reg_paths = [
+            r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+            r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall",
+        ]
+        for root in [winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER]:
+            for reg_path in reg_paths:
+                try:
+                    with winreg.OpenKey(root, reg_path) as key:
+                        idx = 0
+                        while True:
+                            try:
+                                subkey_name = winreg.EnumKey(key, idx)
+                                idx += 1
+                                with winreg.OpenKey(root, f"{reg_path}\\{subkey_name}") as subkey:
+                                    try:
+                                        dn = winreg.QueryValueEx(subkey, "DisplayName")[0]
+                                    except OSError:
+                                        continue
+                                    try:
+                                        loc = winreg.QueryValueEx(subkey, "InstallLocation")[0]
+                                    except OSError:
+                                        loc = ""
+                                    if not isinstance(dn, str) or not dn.strip():
+                                        continue
+                                    for word in dn.strip().split():
+                                        w = word.strip(".,_-").lower()
+                                        if len(w) >= 2 and not GARBAGE(w):
+                                            add_app(w, w)
+                                    if loc and os.path.isdir(loc):
+                                        for f in os.listdir(loc):
+                                            if any(f.lower().endswith(e) for e in (".exe", ".cmd")):
+                                                add_app(dn.strip(), os.path.join(loc, f))
+                                                break
+                            except OSError:
+                                break
+                except OSError:
+                    pass
+
+    known_apps = ["chrome", "msedge", "edge", "firefox", "brave", "vscode", "code",
+                   "notepad", "calc", "winword", "excel", "powerpnt", "paint", "mspaint",
+                   "vlc", "spotify", "discord", "telegram", "whatsapp", "teams", "slack",
+                   "zoom", "skype", "itunes", "onenote", "obs", "ffmpeg", "git", "node",
+                   "python", "javaw", "outlook", "onedrive", "explorer", "cmd",
+                   "powershell", "terminal", "wt", "access", "publisher"]
+    # Also add msedge explicitly since it's not in PATH
+    msedge_paths = [
+        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+    ]
+    for mp in msedge_paths:
+        if os.path.exists(mp):
+            add_app("msedge", mp)
+            add_app("edge", mp)
+            break
+
+    for app in known_apps:
+        exe = shutil.which(app) or shutil.which(f"{app}.exe") or shutil.which(f"{app}.cmd")
+        if exe and os.path.exists(exe):
+            add_app(app.lower(), exe)
+        else:
+            add_app(app.lower(), app)
+
+    try:
+        to_save = {**app_map, "_timestamp": time.time()}
+        with open(cache_path, "w") as f:
+            json.dump(to_save, f)
+    except Exception:
+        pass
+
+    print(f"[APP DISCOVERY]: Found {len(app_map)} apps on this PC")
+    return app_map
+
+
+DYNAMIC_APP_MAP: dict[str, list[str]] = scan_installed_apps()
 
 
 def _find_windows_app(app_name: str) -> str | None:

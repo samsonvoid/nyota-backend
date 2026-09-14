@@ -11,6 +11,8 @@ load_dotenv(os.path.join(BASE_DIR, ".env"))
 
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 
+from .executor import DYNAMIC_APP_MAP
+
 
 def run_command(command: str) -> str:
     """Execute a system shell command on the local Windows machine using PowerShell.
@@ -186,6 +188,18 @@ def parse_local_command(prompt: str, language: str = "en") -> str | None:
          "Nimefungua File Explorer! | I have opened File Explorer for you!"),
     ]
 
+    # Extend app_table with dynamically discovered apps from the full PC scan
+    for app_key, exe_paths in DYNAMIC_APP_MAP.items():
+        if len(app_key) >= 2:
+            for keywords, _, _, _ in app_table:
+                if app_key in keywords:
+                    break
+            else:
+                display_name = " ".join(app_key.split("_")) if "_" in app_key else app_key.replace("-", " ")
+                app_table.append(([app_key, display_name], exe_paths[0] if exe_paths else app_key,
+                                  f"I have opened {display_name} for you!",
+                                  f"Nimefungua {display_name}! | I have opened {display_name} for you!"))
+
     for keywords, app_target, en_reply, sw_reply in app_table:
         if any(kw in clean_prompt for kw in keywords):
             has_action = any(act in clean_prompt for act in launch_actions)
@@ -204,7 +218,7 @@ def parse_local_command(prompt: str, language: str = "en") -> str | None:
         if target_name and len(target_name) <= 60:
             try:
                 import threading
-                from services.executor import _find_windows_app
+                from .executor import _find_windows_app
                 result_holder: list = []
 
                 def _lookup():

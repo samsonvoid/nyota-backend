@@ -14,7 +14,7 @@ from fastapi import APIRouter, HTTPException, Depends, Request
 from pydantic import BaseModel, Field
 from middleware.security import validate_api_key
 from middleware.rate_limit import limiter
-from services.gemini_service import model, query_nyota
+from services.gemini_service import model, query_nyota, parse_local_command
 from services.executor import available_tools, execute_tool
 from services.approvals import approval_store
 from services.memory import memory_context
@@ -132,6 +132,12 @@ def _parse_tool_request(content: str) -> dict[str, object] | None:
 def query_ollama_local(message: str, language: str = "en") -> LocalQueryResult | None:
     """Query Ollama and execute validated local tools from services.executor."""
     try:
+        # Short-circuit: check local offline commands instantly before hitting Ollama
+        local_reply = parse_local_command(message, language)
+        if local_reply:
+            print(f"[LOCAL CMD]: Short-circuited via parse_local_command: '{message}'")
+            return LocalQueryResult(reply=local_reply)
+
         sys_prompt = (
             "You are Nyota Assistant, personal AI assistant for Samson Mwamloso running on Windows.\n"
             "Be concise, direct, and helpful.\n"
@@ -367,13 +373,19 @@ async def chat(request: Request, body: ChatRequest, _=Depends(validate_api_key))
             print(f"[EXECUTOR]: Direct tool query handled via executor.py")
             reply = direct_tool_reply
         else:
-            # 2. Query Ollama local model (qwen2.5-coder:3b)
-            local_result = await asyncio.to_thread(query_ollama_local, body.message, language)
-            approval_id = local_result.approval_id if local_result else None
-            if local_result:
-                reply = local_result.reply
+            # Short-circuit: check local offline commands instantly before hitting Ollama
+            local_reply = parse_local_command(body.message, language)
+            if local_reply:
+                print(f"[LOCAL CMD]: Short-circuited via parse_local_command: '{body.message}'")
+                reply = local_reply
             else:
-                reply = await asyncio.to_thread(query_nyota, body.message, body.conversation_id, language)
+                # 2. Query Ollama local model (qwen2.5-coder:3b)
+                local_result = await asyncio.to_thread(query_ollama_local, body.message, language)
+                approval_id = local_result.approval_id if local_result else None
+                if local_result:
+                    reply = local_result.reply
+                else:
+                    reply = await asyncio.to_thread(query_nyota, body.message, body.conversation_id, language)
     except Exception as e:
         reply = f"Error processing query: {e}"
 
@@ -591,13 +603,19 @@ def voice_chat(request: Request, body: VoiceChatRequest, _=Depends(validate_api_
             print(f"[EXECUTOR]: Direct voice tool query handled via executor.py")
             reply = direct_tool_reply
         else:
-            # 2. Prefer the local Ollama model (qwen2.5-coder:3b), then fall back to Gemini/Mistral.
-            local_result = query_ollama_local(user_query, lang)
-            if local_result:
-                reply = local_result.reply
-                approval_id = local_result.approval_id
+            # Short-circuit: check local offline commands instantly before hitting Ollama
+            local_reply = parse_local_command(user_query, lang)
+            if local_reply:
+                print(f"[LOCAL CMD]: Short-circuited via parse_local_command: '{user_query}'")
+                reply = local_reply
             else:
-                reply = query_nyota(user_query, body.conversation_id, lang)
+                # 2. Prefer the local Ollama model (qwen2.5-coder:3b), then fall back to Gemini/Mistral.
+                local_result = query_ollama_local(user_query, lang)
+                if local_result:
+                    reply = local_result.reply
+                    approval_id = local_result.approval_id
+                else:
+                    reply = query_nyota(user_query, body.conversation_id, lang)
 
     except Exception as e:
         print(f"Voice query processing failed: {e}")
