@@ -89,3 +89,9 @@ async def root(request: Request):
 @limiter.limit("10/minute")
 async def health(request: Request):
     return {"status": "healthy", "daemon": "active"}
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("nyota_engine:app", host="0.0.0.0", port=8000, reload=True)
+

@@ -114,42 +114,123 @@ MISTRAL_KEYS = [
 
 def parse_local_command(prompt: str, language: str = "en") -> str | None:
     """Offline Swahili/English NLP local command parser.
-    Intercepts basic requests (like opening Notepad, Calculator, Web Browser, Project folder, 
-    and common greetings/gratitude) so they execute instantly and offline.
+    Intercepts app launch requests and common greetings instantly, without Ollama or Gemini.
     """
-    # Normalize input
     clean_prompt = prompt.strip().lower()
-    # Remove common ending/starting punctuation
     clean_prompt = re.sub(r'[?!.,;:_#@*()\-+]', ' ', clean_prompt).strip()
-    # Replace multiple spaces with a single space
     clean_prompt = re.sub(r'\s+', ' ', clean_prompt)
-    
-    # 1. Notepad patterns
-    notepad_words = ["notepad", "notipadi"]
-    if any(w in clean_prompt for w in notepad_words):
-        if any(action in clean_prompt for action in ["fungua", "washa", "nionyeshe", "open", "launch", "start", "run"]) or clean_prompt in notepad_words:
-            open_app_or_file("notepad.exe")
-            if language == "en":
-                return "I have opened Notepad for you!"
-            return "Nimefungua Notepad kwa ajili yako! | I have opened Notepad for you!"
-        
-    # 2. Calculator patterns
-    calc_words = ["calculator", "kikokotoo", "calc"]
-    if any(w in clean_prompt for w in calc_words):
-        if any(action in clean_prompt for action in ["fungua", "washa", "nionyeshe", "open", "launch", "start", "run"]) or clean_prompt in calc_words:
-            open_app_or_file("calc.exe")
-            if language == "en":
-                return "I have opened the Calculator for you!"
-            return "Nimefungua Kikokotoo (Calculator) kwa ajili yako! | I have opened the Calculator for you!"
-        
-    # 3. Browser / Internet / Google patterns
+
+    launch_actions = [
+        "launch", "open", "start", "run", "execute", "fire up",
+        "fungua", "washa", "washe", "anzisha", "endesha",
+    ]
+
+    # 1. Known-app keyword table
+    app_table = [
+        (["notepad", "notipadi"], "notepad.exe",
+         "I have opened Notepad for you!",
+         "Nimefungua Notepad kwa ajili yako! | I have opened Notepad for you!"),
+        (["calculator", "kikokotoo", "calc"], "calc.exe",
+         "I have opened the Calculator for you!",
+         "Nimefungua Kikokotoo (Calculator) kwa ajili yako! | I have opened the Calculator for you!"),
+        (["chrome", "google chrome"], "chrome",
+         "I have opened Google Chrome for you!",
+         "Nimefungua Google Chrome! | I have opened Google Chrome for you!"),
+        (["msedge", "edge", "microsoft edge"], "msedge",
+         "I have opened Microsoft Edge for you!",
+         "Nimefungua Microsoft Edge! | I have opened Microsoft Edge for you!"),
+        (["firefox"], "firefox",
+         "I have opened Firefox for you!",
+         "Nimefungua Firefox! | I have opened Firefox for you!"),
+        (["vscode", "vs code", "visual studio code", "code"], "code",
+         "I have opened Visual Studio Code for you!",
+         "Nimefungua VS Code! | I have opened Visual Studio Code for you!"),
+        (["spotify"], "spotify",
+         "I have opened Spotify for you!",
+         "Nimefungua Spotify! | I have opened Spotify for you!"),
+        (["discord"], "discord",
+         "I have opened Discord for you!",
+         "Nimefungua Discord! | I have opened Discord for you!"),
+        (["telegram"], "telegram",
+         "I have opened Telegram for you!",
+         "Nimefungua Telegram! | I have opened Telegram for you!"),
+        (["whatsapp"], "whatsapp",
+         "I have opened WhatsApp for you!",
+         "Nimefungua WhatsApp! | I have opened WhatsApp for you!"),
+        (["word", "ms word", "microsoft word"], "word",
+         "I have opened Microsoft Word for you!",
+         "Nimefungua Microsoft Word! | I have opened Microsoft Word for you!"),
+        (["excel", "ms excel", "microsoft excel"], "excel",
+         "I have opened Microsoft Excel for you!",
+         "Nimefungua Microsoft Excel! | I have opened Microsoft Excel for you!"),
+        (["powerpoint", "ppt", "ms powerpoint"], "powerpoint",
+         "I have opened PowerPoint for you!",
+         "Nimefungua PowerPoint! | I have opened PowerPoint for you!"),
+        (["vlc", "vlc player"], "vlc",
+         "I have opened VLC Media Player for you!",
+         "Nimefungua VLC! | I have opened VLC Media Player for you!"),
+        (["paint", "ms paint"], "paint",
+         "I have opened MS Paint for you!",
+         "Nimefungua Paint! | I have opened MS Paint for you!"),
+        (["terminal", "windows terminal"], "terminal",
+         "I have opened Windows Terminal for you!",
+         "Nimefungua Terminal! | I have opened Windows Terminal for you!"),
+        (["powershell"], "powershell",
+         "I have opened PowerShell for you!",
+         "Nimefungua PowerShell! | I have opened PowerShell for you!"),
+        (["cmd", "command prompt"], "cmd",
+         "I have opened the Command Prompt for you!",
+         "Nimefungua Command Prompt! | I have opened Command Prompt for you!"),
+        (["explorer", "file explorer"], "explorer",
+         "I have opened File Explorer for you!",
+         "Nimefungua File Explorer! | I have opened File Explorer for you!"),
+    ]
+
+    for keywords, app_target, en_reply, sw_reply in app_table:
+        if any(kw in clean_prompt for kw in keywords):
+            has_action = any(act in clean_prompt for act in launch_actions)
+            is_exact = clean_prompt in keywords
+            if has_action or is_exact:
+                open_app_or_file(app_target)
+                return en_reply if language == "en" else sw_reply
+
+    # 2. Generic "launch/open <anything>" catch-all
+    generic_match = re.match(
+        r'^(?:launch|open|start|run|execute|fire up|fungua|washa|washe|anzisha|endesha)\s+(.+)$',
+        clean_prompt
+    )
+    if generic_match:
+        target_name = generic_match.group(1).strip()
+        if target_name and len(target_name) <= 60:
+            try:
+                import threading
+                from services.executor import _find_windows_app
+                result_holder: list = []
+
+                def _lookup():
+                    path = _find_windows_app(target_name)
+                    result_holder.append(path)
+
+                t = threading.Thread(target=_lookup, daemon=True)
+                t.start()
+                t.join(timeout=2.0)
+
+                if result_holder and result_holder[0] and os.path.exists(result_holder[0]):
+                    open_app_or_file(result_holder[0])
+                    if language == "en":
+                        return f"I have launched {target_name} for you!"
+                    return f"Nimefungua {target_name}! | I have launched {target_name} for you!"
+            except Exception as e:
+                print(f"[LOCAL CMD]: Generic launch failed for '{target_name}': {e}")
+
+    # 3. Browser / Google URL patterns
     browser_words = ["browser", "broswer", "broza", "internet", "google"]
     if any(w in clean_prompt for w in browser_words):
-        if any(action in clean_prompt for action in ["fungua", "washa", "washe", "nionyeshe", "open", "launch", "start", "run"]) or clean_prompt in ["browser", "broswer", "broza"]:
+        if any(act in clean_prompt for act in launch_actions) or clean_prompt in ["browser", "broswer", "broza"]:
             open_app_or_file("https://www.google.com")
             if language == "en":
-                return "I have opened your Google web browser!"
-            return "Nimefungua kivinjari chako cha Google! | I have opened your Google web browser!"
+                return "I have opened your web browser!"
+            return "Nimefungua kivinjari chako! | I have opened your web browser!"
 
     # 4. Project Folder / Directory patterns
     folder_words = ["folder", "folda", "directory", "dir", "workspace", "mradi"]
@@ -161,21 +242,24 @@ def parse_local_command(prompt: str, language: str = "en") -> str | None:
                 return "I have opened the project directory in File Explorer!"
             return "Nimefungua folda ya mradi kwenye File Explorer! | I have opened the project directory in File Explorer!"
 
-    # 5. Greetings patterns
+    # 5. Greetings
     swahili_greetings = ["mambo", "habari", "jambo", "sasa", "kisasa", "vipi mambo"]
     english_greetings = ["hello", "hi", "hey", "how are you"]
-    
     words = clean_prompt.split()
     if len(words) <= 3:
-        if clean_prompt in swahili_greetings or any(clean_prompt.startswith(g) for g in swahili_greetings) or clean_prompt in english_greetings or any(clean_prompt.startswith(g) for g in english_greetings):
+        if (
+            clean_prompt in swahili_greetings
+            or any(clean_prompt.startswith(g) for g in swahili_greetings)
+            or clean_prompt in english_greetings
+            or any(clean_prompt.startswith(g) for g in english_greetings)
+        ):
             if language == "en":
                 return "Hello Samson! I am doing great and ready to assist you. | Hello Samson! I am doing great and ready to assist you."
             return "Safi sana Samson! Habari yako? Nikusaidie nini leo? | I am doing great Samson! How are you? How can I help you today?"
 
-    # 6. Gratitude patterns
+    # 6. Gratitude
     swahili_thanks = ["asante", "asante sana", "shukran", "shukrani"]
     english_thanks = ["thank you", "thanks", "appreciate it"]
-    
     if len(words) <= 3:
         if any(t in clean_prompt for t in swahili_thanks) or any(t in clean_prompt for t in english_thanks):
             if language == "en":

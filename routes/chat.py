@@ -1,5 +1,6 @@
 import os
 import json
+import re
 import tempfile
 import wave
 import asyncio
@@ -58,25 +59,100 @@ class LocalQueryResult:
     reply: str
     approval_id: str | None = None
 
+def _extract_launch_app(message: str) -> str | None:
+    """Detect direct app launch requests like 'open msedge', 'launch chrome', 'fungua vscode'."""
+    clean = message.strip().lower()
+    clean = re.sub(r'[?!.,;:_#@*()\-+]', ' ', clean).strip()
+    match = re.match(
+        r'^(?:launch|open|start|run|fire up|fungua|washa|anzisha)\s+([a-zA-Z0-9_\- ]+)$',
+        clean
+    )
+    if match:
+        target = match.group(1).strip()
+        non_apps = {"a file", "the door", "project", "folder", "browser", "internet"}
+        if target in {"browser", "internet"}:
+            return "msedge"
+        if target in {"folder", "project"}:
+            return "explorer"
+        if target and len(target.split()) <= 3 and target not in non_apps:
+            return target
+    return None
+
+
+def _check_direct_tool(message: str) -> str | None:
+    """Detect direct queries for system tools, dev environment, or hardware info."""
+    clean = message.strip().lower()
+    clean = re.sub(r'[?!.,;:_#@*()\-+]', ' ', clean).strip()
+
+    # Check for installed tools / applications query
+    tool_keywords = [
+        "list the all application", "list all application", "list application",
+        "list all tools", "list tools", "available tools", "installed tools",
+        "installed applications", "what tools do i have", "programs installed",
+        "orodha ya programu", "programu zilizopo"
+    ]
+    if any(kw in clean for kw in tool_keywords):
+        res = execute_tool("installed_tools", {})
+        return res.get("output", "Could not query installed tools.")
+
+    # Check for system hardware stats
+    sys_keywords = ["system info", "system status", "pc info", "hardware info", "hali ya kompyuta"]
+    if any(kw in clean for kw in sys_keywords):
+        res = execute_tool("system_info", {})
+        return res.get("output", "Could not query system info.")
+
+    return None
+
+
+def _parse_tool_request(content: str) -> dict[str, object] | None:
+    """Parse JSON tool requests, extracting JSON even if surrounded by text or markdown."""
+    # 1. Regex search for JSON object with "action": "execute"
+    match = re.search(r'\{[^{}]*"action"\s*:\s*"execute"[^{}]*\}', content, re.DOTALL)
+    if match:
+        try:
+            parsed = json.loads(match.group(0))
+            if isinstance(parsed, dict) and parsed.get("action") == "execute":
+                return parsed
+        except json.JSONDecodeError:
+            pass
+
+    # 2. Markdown or trimmed candidate
+    candidate = content.strip()
+    if candidate.startswith("```"):
+        candidate = candidate.strip("`").removeprefix("json").strip()
+    try:
+        parsed = json.loads(candidate)
+        if isinstance(parsed, dict) and parsed.get("action") == "execute":
+            return parsed
+    except Exception:
+        pass
+    return None
+
+
 def query_ollama_local(message: str, language: str = "en") -> LocalQueryResult | None:
-    """Query Ollama and execute only validated, registered local tools."""
+    """Query Ollama and execute validated local tools from services.executor."""
     try:
         sys_prompt = (
-    "Wewe ni Nyota Assistant, msaidizi binafsi wa Samson Mwamloso. "
-    "Jibu kwa ufupi, usahihi na kwa lugha inayoeleweka kulingana na swali. "
-    "Una tools salama za read-only na tools zinazohitaji approval kama 'launch_app'. "
-    "Ikiwa mtumiaji anaomba kutumia au kuanzisha programu (kama VS Code au Chrome), au kuitisha tool yoyote, "
-    "rudisha JSON pekee katika muundo huu: "
-    '{"action":"execute","tool":"launch_app","arguments":{"app_name":"code"}}. '
-    "Usibuni tools au commands zisizokuwepo. Kwa mazungumzo ya kawaida yasiyo hitaji tool, jibu kwa maandishi ya kawaida."
-)
+            "You are Nyota Assistant, personal AI assistant for Samson Mwamloso running on Windows.\n"
+            "Be concise, direct, and helpful.\n"
+            "You have access to tools defined in executor.py.\n"
+            "CRITICAL TOOL INSTRUCTION:\n"
+            "When the user asks to open or launch an application (such as Edge, Chrome, VS Code, Notepad, Calculator, Word, Excel, Spotify, etc.), "
+            "you MUST output ONLY a JSON object in this exact format and NOTHING else:\n"
+            '{"action":"execute","tool":"launch_app","arguments":{"app_name":"<app_name>"}}\n'
+            "Examples:\n"
+            'User: "open msedge" -> {"action":"execute","tool":"launch_app","arguments":{"app_name":"msedge"}}\n'
+            'User: "launch chrome" -> {"action":"execute","tool":"launch_app","arguments":{"app_name":"chrome"}}\n'
+            'User: "fungua vscode" -> {"action":"execute","tool":"launch_app","arguments":{"app_name":"code"}}\n'
+            "Do NOT output markdown blocks, code explanations, or conversational filler when invoking a tool.\n"
+            "For regular questions and conversation that do not require a tool, reply with plain text."
+        )
         if language == "sw":
-            sys_prompt += " Jibu kwa Kiswahili fasaha pekee."
+            sys_prompt += "\nJibu kwa Kiswahili fasaha kwa maongezi ya kawaida."
         else:
-            sys_prompt += " Respond strictly in English."
+            sys_prompt += "\nRespond strictly in English for regular conversation."
 
-        sys_prompt += f" Available tools: {json.dumps(available_tools(), ensure_ascii=True)}"
-        sys_prompt += f"\nVerified local context:\n{memory_context()}"
+        sys_prompt += f"\nAvailable tools: {json.dumps([t['name'] for t in available_tools()], ensure_ascii=True)}"
 
         started_at = time.perf_counter()
         response = ollama.chat(
@@ -86,15 +162,15 @@ def query_ollama_local(message: str, language: str = "en") -> LocalQueryResult |
                 {"role": "user", "content": message}
             ],
             options={
-                "temperature": 0.2,
+                "temperature": 0.1,
                 "top_p": 0.9,
-                "num_predict": 160,
+                "num_predict": 120,
             },
             keep_alive="10m",
         )
         elapsed = time.perf_counter() - started_at
         ai_reply = response["message"]["content"].strip()
-        print(f"[OLLAMA]: Response generated in {elapsed:.2f}s")
+        print(f"[OLLAMA]: Response generated in {elapsed:.2f}s: {ai_reply[:80]}")
 
         tool_request = _parse_tool_request(ai_reply)
         if not tool_request:
@@ -118,45 +194,12 @@ def query_ollama_local(message: str, language: str = "en") -> LocalQueryResult |
                 approval_id=approval.approval_id,
             )
 
-        print(f"[TOOL]: Executing read-only tool {tool_name} with {arguments}")
-        tool_result = execute_tool(tool_name, arguments)
-        follow_up = ollama.chat(
-            model="qwen2.5-coder:3b",
-            messages=[
-                {"role": "system", "content": sys_prompt},
-                {"role": "user", "content": message},
-                {"role": "assistant", "content": ai_reply},
-                {
-                    "role": "user",
-                    "content": (
-                        f"Tool result for {tool_name}:\n{json.dumps(tool_result, ensure_ascii=True)}\n"
-                        "Summarize the result briefly. Do not propose another tool call."
-                    ),
-                },
-            ],
-            options={"temperature": 0.2, "num_predict": 160},
-            keep_alive="10m",
-        )
-        return LocalQueryResult(reply=follow_up["message"]["content"].strip())
+        print(f"[TOOL]: Executing {tool_name} with {arguments} via executor.py")
+        tool_result = execute_tool(tool_name, arguments, approved=True)
+        return LocalQueryResult(reply=tool_result.get("output", f"{tool_name} completed."))
     except Exception as e:
         print(f"[OLLAMA ERROR]: Local Ollama failed ({e}). Falling back to Gemini...")
         return None
-
-
-def _parse_tool_request(content: str) -> dict[str, object] | None:
-    """Parse strict JSON tool requests, including fenced JSON from small models."""
-    candidate = content.strip()
-    if candidate.startswith("```"):
-        candidate = candidate.strip("`").removeprefix("json").strip()
-    if not candidate.startswith("{") or not candidate.endswith("}"):
-        return None
-    try:
-        parsed = json.loads(candidate)
-    except json.JSONDecodeError:
-        return None
-    if isinstance(parsed, dict) and parsed.get("action") == "execute":
-        return parsed
-    return None
 
 
 def warm_ollama_local():
@@ -188,6 +231,33 @@ def calculate_rms(audio_data: bytes) -> float:
         return 0.0
 
 
+def _sanitize_for_voice(text: str) -> str:
+    """Prepare text for natural SAPI5 TTS: strip file paths, raw JSON syntax, and markdown."""
+    clean = text.strip()
+
+    # 1. If text is a raw JSON dict, convert to friendly natural speech
+    if clean.startswith("{") and clean.endswith("}"):
+        try:
+            parsed = json.loads(clean)
+            if isinstance(parsed, dict):
+                items = [k for k, v in parsed.items() if v and "not" not in str(v).lower()]
+                if items:
+                    return f"Available tools found on your system include: {', '.join(items)}."
+        except Exception:
+            pass
+
+    # 2. If text contains "from C:\..." or any file path, strip it cleanly
+    clean = re.sub(r'from\s+[A-Za-z]:\\[^\n\r.]+\.[a-zA-Z0-9]+', '', clean, flags=re.IGNORECASE)
+    clean = re.sub(r'[A-Za-z]:\\[^\n\r.]+\.[a-zA-Z0-9]+', '', clean, flags=re.IGNORECASE)
+
+    # 3. Clean markdown code fences and symbols
+    clean = re.sub(r'```[a-zA-Z]*', '', clean)
+    clean = clean.replace('`', '').replace('*', '').replace('#', '')
+    clean = re.sub(r'\s+', ' ', clean).strip()
+
+    return clean
+
+
 def speak_async(text: str):
     global active_tts_engine
     try:
@@ -195,6 +265,10 @@ def speak_async(text: str):
             text_to_speak = text.split("|")[1].strip()
         else:
             text_to_speak = text.strip()
+
+        text_to_speak = _sanitize_for_voice(text_to_speak)
+        if not text_to_speak:
+            return
 
         # Re-initialize pyttsx3 inside the thread
         engine = pyttsx3.init()
@@ -282,13 +356,24 @@ async def chat(request: Request, body: ChatRequest, _=Depends(validate_api_key))
     try:
         language = body.language or "en"
 
-        # Prefer the local Ollama model, then fall back to Gemini/Mistral.
-        local_result = await asyncio.to_thread(query_ollama_local, body.message, language)
-        approval_id = local_result.approval_id if local_result else None
-        if local_result:
-            reply = local_result.reply
+        # 1. Direct tool execution via executor.py for launch & tool requests
+        target_app = _extract_launch_app(body.message)
+        direct_tool_reply = _check_direct_tool(body.message)
+        if target_app:
+            print(f"[EXECUTOR]: Direct launch detected for '{target_app}' via executor.py")
+            res = execute_tool("launch_app", {"app_name": target_app}, approved=True)
+            reply = res.get("output", f"Opening {target_app.title()}.")
+        elif direct_tool_reply:
+            print(f"[EXECUTOR]: Direct tool query handled via executor.py")
+            reply = direct_tool_reply
         else:
-            reply = await asyncio.to_thread(query_nyota, body.message, body.conversation_id, language)
+            # 2. Query Ollama local model (qwen2.5-coder:3b)
+            local_result = await asyncio.to_thread(query_ollama_local, body.message, language)
+            approval_id = local_result.approval_id if local_result else None
+            if local_result:
+                reply = local_result.reply
+            else:
+                reply = await asyncio.to_thread(query_nyota, body.message, body.conversation_id, language)
     except Exception as e:
         reply = f"Error processing query: {e}"
 
@@ -495,13 +580,24 @@ def voice_chat(request: Request, body: VoiceChatRequest, _=Depends(validate_api_
                     is_silence=True
                 )
 
-        # Prefer the local Ollama model, then fall back to Gemini/Mistral.
-        local_result = query_ollama_local(user_query, lang)
-        if local_result:
-            reply = local_result.reply
-            approval_id = local_result.approval_id
+        # 1. Direct tool execution via executor.py for voice launch & tool requests
+        target_app = _extract_launch_app(user_query)
+        direct_tool_reply = _check_direct_tool(user_query)
+        if target_app:
+            print(f"[EXECUTOR]: Direct voice launch detected for '{target_app}' via executor.py")
+            res = execute_tool("launch_app", {"app_name": target_app}, approved=True)
+            reply = res.get("output", f"Opening {target_app.title()}.")
+        elif direct_tool_reply:
+            print(f"[EXECUTOR]: Direct voice tool query handled via executor.py")
+            reply = direct_tool_reply
         else:
-            reply = query_nyota(user_query, body.conversation_id, lang)
+            # 2. Prefer the local Ollama model (qwen2.5-coder:3b), then fall back to Gemini/Mistral.
+            local_result = query_ollama_local(user_query, lang)
+            if local_result:
+                reply = local_result.reply
+                approval_id = local_result.approval_id
+            else:
+                reply = query_nyota(user_query, body.conversation_id, lang)
 
     except Exception as e:
         print(f"Voice query processing failed: {e}")

@@ -76,8 +76,8 @@ TOOLS = {
     ),
     "launch_app": ToolDefinition(
         name="launch_app",
-        description="Launch an allowed desktop application available on PATH.",
-        requires_approval=True,  # Inahitaji ubonyeze YES/NO kiooni kabla ya kuanza
+        description="Launch a desktop application like msedge, chrome, code, notepad, or calc.",
+        requires_approval=False,
     ),
 }
 
@@ -327,11 +327,20 @@ def installed_tools() -> dict[str, Any]:
     arguments: dict[str, Any] = {}
     try:
         tool_names = ["git", "node", "python", "php", "docker", "code", "ollama", "npm"]
-        status = {
-            tool: shutil.which(tool) or "Not installed / not in PATH"
-            for tool in tool_names
+        installed = [t for t in tool_names if shutil.which(t)]
+        missing = [t for t in tool_names if not shutil.which(t)]
+        
+        display_names = {
+            "git": "Git", "node": "Node.js", "python": "Python",
+            "php": "PHP", "docker": "Docker", "code": "VS Code",
+            "ollama": "Ollama", "npm": "NPM"
         }
-        return _finish("installed_tools", arguments, started_at, True, json.dumps(status, ensure_ascii=True))
+        installed_str = ", ".join(display_names.get(t, t) for t in installed)
+        output = f"Available tools found on your PC: {installed_str}."
+        if missing:
+            missing_str = ", ".join(display_names.get(t, t) for t in missing)
+            output += f" Not detected: {missing_str}."
+        return _finish("installed_tools", arguments, started_at, True, output)
     except OSError as error:
         return _finish("installed_tools", arguments, started_at, False, f"Installed tools error: {error}")
 
@@ -403,68 +412,178 @@ def frontend_build(path: str | None = None) -> dict[str, Any]:
         return _finish("frontend_build", arguments, started_at, False, f"Frontend build error: {error}")
 
 
+APP_ALIASES: dict[str, list[str]] = {
+    "vscode": ["code.cmd", "code.exe", "Code.exe"],
+    "code": ["code.cmd", "code.exe", "Code.exe"],
+    "visual studio code": ["code.cmd", "code.exe", "Code.exe"],
+    "vs code": ["code.cmd", "code.exe", "Code.exe"],
+    "chrome": ["chrome.exe"],
+    "google chrome": ["chrome.exe"],
+    "browser": ["msedge.exe", "chrome.exe", "brave.exe", "firefox.exe"],
+    "msedge": ["msedge.exe"],
+    "edge": ["msedge.exe"],
+    "microsoft edge": ["msedge.exe"],
+    "brave": ["brave.exe"],
+    "firefox": ["firefox.exe"],
+    "notepad": ["notepad.exe"],
+    "notipadi": ["notepad.exe"],
+    "calculator": ["calc.exe"],
+    "kikokotoo": ["calc.exe"],
+    "calc": ["calc.exe"],
+    "word": ["WINWORD.EXE", "winword.exe"],
+    "ms word": ["WINWORD.EXE", "winword.exe"],
+    "microsoft word": ["WINWORD.EXE", "winword.exe"],
+    "excel": ["EXCEL.EXE", "excel.exe"],
+    "ms excel": ["EXCEL.EXE", "excel.exe"],
+    "microsoft excel": ["EXCEL.EXE", "excel.exe"],
+    "powerpoint": ["POWERPNT.EXE", "powerpnt.exe"],
+    "ppt": ["POWERPNT.EXE", "powerpnt.exe"],
+    "spotify": [
+        "Spotify.exe",
+        "spotify.exe",
+        os.path.join(os.getenv("APPDATA", ""), r"Spotify\Spotify.exe"),
+        os.path.join(os.getenv("LOCALAPPDATA", ""), r"Microsoft\WindowsApps\Spotify.exe"),
+    ],
+    "discord": ["Discord.exe", "discord.exe"],
+    "telegram": ["Telegram.exe", "telegram.exe"],
+    "whatsapp": ["WhatsApp.exe", "whatsapp.exe"],
+    "vlc": ["vlc.exe"],
+    "paint": ["mspaint.exe"],
+    "explorer": ["explorer.exe"],
+    "file explorer": ["explorer.exe"],
+    "terminal": ["wt.exe", "powershell.exe", "cmd.exe"],
+    "cmd": ["cmd.exe"],
+    "command prompt": ["cmd.exe"],
+    "powershell": ["powershell.exe"],
+}
+
+
+def _clean_registry_path(raw_val: str) -> str | None:
+    if not raw_val or not isinstance(raw_val, str):
+        return None
+    cleaned = raw_val.strip().strip('"')
+    if os.path.exists(cleaned):
+        return cleaned
+    if ".exe" in cleaned.lower():
+        idx = cleaned.lower().find(".exe") + 4
+        exe_path = cleaned[:idx].strip().strip('"')
+        if os.path.exists(exe_path):
+            return exe_path
+    return None
+
+
+def _find_start_menu_shortcut(app_name: str) -> str | None:
+    if os.name != "nt":
+        return None
+    start_menu_dirs = [
+        os.path.join(os.getenv("PROGRAMDATA", r"C:\ProgramData"), r"Microsoft\Windows\Start Menu\Programs"),
+        os.path.join(os.getenv("APPDATA", ""), r"Microsoft\Windows\Start Menu\Programs"),
+    ]
+    query_clean = app_name.lower().replace(" ", "")
+    for start_dir in start_menu_dirs:
+        if not start_dir or not os.path.exists(start_dir):
+            continue
+        for root_dir, dirnames, filenames in os.walk(start_dir):
+            for fn in filenames:
+                if fn.lower().endswith(".lnk"):
+                    shortcut_name = fn[:-4].lower().replace(" ", "")
+                    if query_clean in shortcut_name or shortcut_name in query_clean:
+                        return os.path.join(root_dir, fn)
+    return None
+
+
+UWP_APPS: dict[str, str] = {
+    "camera": "microsoft.windows.camera:",
+    "webcam": "microsoft.windows.camera:",
+    "picha": "microsoft.windows.camera:",
+    "settings": "ms-settings:",
+    "store": "ms-windows-store:",
+    "photos": "ms-photos:",
+    "clock": "ms-clock:",
+    "alarm": "ms-clock:",
+    "alarms": "ms-clock:",
+}
+
+
 def _find_windows_app(app_name: str) -> str | None:
-    """Tafuta executable path kwenye PATH, App Paths za Registry, na Folders kuu za Windows."""
-    # 0. First check hybrid memory for learned path
-    learned_path = _get_learned_path(app_name)
+    """Tafuta executable au shortcut path au UWP protocol kwa njia ya haraka na ya uhakika."""
+    clean_name = app_name.strip().lower()
+
+    # 0. Check UWP protocol schemes first (e.g. camera, settings)
+    if clean_name in UWP_APPS:
+        return UWP_APPS[clean_name]
+
+    # 1. Check hybrid memory for previously learned path
+    learned_path = _get_learned_path(clean_name)
     if learned_path and os.path.exists(learned_path):
-        print(f"[EXECUTOR]: Using learned path for '{app_name}': {learned_path}")
+        print(f"[EXECUTOR]: Using learned path for '{clean_name}': {learned_path}")
         return learned_path
 
-    # 1. Jaribu kupata kwenye PATH ya mfumo
-    found_path = shutil.which(app_name)
-    if found_path:
-        return found_path
+    # Candidate binary names from alias mapping or raw input
+    candidates = APP_ALIASES.get(clean_name, [])
+    if not candidates:
+        candidate_exe = clean_name if clean_name.endswith(".exe") else f"{clean_name}.exe"
+        candidates = [clean_name, candidate_exe]
 
-    # 2. Majina mbadala ya kawaida (Aliases)
-    aliases = {
-        "vscode": "code",
-        "chrome": "chrome.exe",
-        "browser": "chrome.exe",
-        "notepad": "notepad.exe",
-    }
-    executable_name = aliases.get(app_name.lower(), app_name)
-    if not executable_name.endswith(".exe"):
-        executable_name += ".exe"
+    # 2. PATH search or direct path check
+    for candidate in candidates:
+        if os.path.isabs(candidate) and os.path.exists(candidate):
+            return candidate
+        found_path = shutil.which(candidate)
+        if found_path:
+            return found_path
 
-    # 3. Angalia kwenye Windows Registry (HKEY_LOCAL_MACHINE & HKEY_CURRENT_USER)
+    # 3. Windows Registry App Paths lookup
     if os.name == "nt":
         import winreg
-        registry_paths = [
-            rf"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\{executable_name}",
-            rf"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths\{executable_name}"
-        ]
-        for root in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
-            for reg_path in registry_paths:
-                try:
-                    with winreg.OpenKey(root, reg_path) as key:
-                        val, _ = winreg.QueryValueEx(key, "")
-                        if val and os.path.exists(val):
-                            return val
-                except OSError:
-                    continue
+        for candidate in candidates:
+            exe_key = candidate if candidate.endswith(".exe") else f"{candidate}.exe"
+            registry_paths = [
+                rf"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\{exe_key}",
+                rf"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths\{exe_key}",
+            ]
+            for root in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+                for reg_path in registry_paths:
+                    try:
+                        with winreg.OpenKey(root, reg_path) as key:
+                            val, _ = winreg.QueryValueEx(key, "")
+                            resolved = _clean_registry_path(val)
+                            if resolved:
+                                return resolved
+                    except OSError:
+                        continue
 
-    # 4. Search kwenye Maeneo Makuu ya Windows (Standard Folders)
+    # 4. Start Menu Shortcuts (.lnk) lookup
+    shortcut = _find_start_menu_shortcut(clean_name)
+    if shortcut:
+        return shortcut
+
+    # 5. Shallow search in target Windows program directories (max depth 3 with pruning)
+    local_appdata = os.getenv("LOCALAPPDATA", "")
     possible_roots = [
-        os.getenv("LOCALAPPDATA", ""),
-        os.getenv("PROGRAMFILES", ""),
-        os.getenv("PROGRAMFILES(X86)", ""),
+        os.path.join(local_appdata, "Programs") if local_appdata else "",
+        os.getenv("PROGRAMFILES", r"C:\Program Files"),
+        os.getenv("PROGRAMFILES(X86)", r"C:\Program Files (x86)"),
         r"C:\Windows\System32",
+        r"C:\Windows",
     ]
+    candidate_lowers = set(c.lower() for c in candidates)
     for root_dir in possible_roots:
         if not root_dir or not os.path.exists(root_dir):
             continue
-        for dirpath, _, filenames in os.walk(root_dir):
-            if dirpath.count(os.sep) - root_dir.count(os.sep) > 3:
-                continue
-            if executable_name.lower() in [f.lower() for f in filenames]:
-                return os.path.join(dirpath, executable_name)
+        for dirpath, dirnames, filenames in os.walk(root_dir):
+            depth = dirpath.count(os.sep) - root_dir.count(os.sep)
+            if depth >= 3:
+                dirnames.clear()
+            for fn in filenames:
+                if fn.lower() in candidate_lowers:
+                    return os.path.join(dirpath, fn)
 
     return None
 
 
 def launch_app(app_name: str) -> dict[str, Any]:
-    """Launch an application dynamic lookup without hardcoding paths."""
+    """Launch an application or UWP app with clean natural speech response."""
     started_at = time.perf_counter()
     arguments = {"app_name": app_name}
     try:
@@ -472,15 +591,42 @@ def launch_app(app_name: str) -> dict[str, Any]:
             raise ValueError("Application name is required")
 
         target_path = _find_windows_app(app_name)
-
-        if not target_path or not os.path.exists(target_path):
+        if not target_path:
             raise ValueError(f"Could not locate '{app_name}' on this machine. Make sure it is installed.")
 
-        subprocess.Popen([target_path], creationflags=subprocess.DETACHED_PROCESS if os.name == "nt" else 0)
+        # Format clean display name for voice
+        display_names = {
+            "vscode": "VS Code", "code": "VS Code", "visual studio code": "VS Code",
+            "msedge": "Microsoft Edge", "edge": "Microsoft Edge",
+            "chrome": "Google Chrome", "calc": "Calculator", "calculator": "Calculator",
+            "notepad": "Notepad", "camera": "Camera", "webcam": "Camera",
+            "settings": "Settings", "word": "Word", "excel": "Excel", "spotify": "Spotify"
+        }
+        app_display = display_names.get(app_name.lower().strip(), app_name.title())
 
-        return _finish("launch_app", arguments, started_at, True, f"Successfully launched {app_name} from {target_path}.")
+        # Handle UWP Protocol URI (e.g. microsoft.windows.camera:, ms-settings:)
+        if target_path.endswith(":") or target_path.startswith(("microsoft.", "ms-")):
+            if os.name == "nt":
+                try:
+                    os.startfile(target_path)
+                except Exception:
+                    subprocess.Popen(f"start {target_path}", shell=True)
+            return _finish("launch_app", arguments, started_at, True, f"Opening {app_display}.")
+
+        if not os.path.exists(target_path):
+            raise ValueError(f"Could not locate '{app_name}' on this machine. Make sure it is installed.")
+
+        if os.name == "nt":
+            try:
+                os.startfile(target_path)
+            except Exception:
+                subprocess.Popen(target_path, shell=True)
+        else:
+            subprocess.Popen([target_path])
+
+        return _finish("launch_app", arguments, started_at, True, f"Opening {app_display}.")
     except (OSError, ValueError) as error:
-        return _finish("launch_app", arguments, started_at, False, f"Launch app error: {error}")
+        return _finish("launch_app", arguments, started_at, False, f"Could not launch {app_name}. {error}")
 
 
 def execute_tool(
