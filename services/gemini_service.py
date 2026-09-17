@@ -11,7 +11,7 @@ load_dotenv(os.path.join(BASE_DIR, ".env"))
 
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 
-from .executor import DYNAMIC_APP_MAP
+from .executor import DYNAMIC_APP_MAP, execute_tool
 
 
 def run_command(command: str) -> str:
@@ -127,24 +127,67 @@ def parse_local_command(prompt: str, language: str = "en") -> str | None:
         "fungua", "washa", "washe", "anzisha", "endesha",
     ]
 
-    # 1. Known-app keyword table
+    close_actions = [
+        "close", "exit", "quit", "stop", "terminate", "shutdown",
+        "funga", "acha", "simamisha", "zima",
+    ]
+
+    # 1. Known-app keyword table — ordered longest-match first to avoid "microsoft" matching before "microsoft store"
     app_table = [
-        (["notepad", "notipadi"], "notepad.exe",
-         "I have opened Notepad for you!",
-         "Nimefungua Notepad kwa ajili yako! | I have opened Notepad for you!"),
-        (["calculator", "kikokotoo", "calc"], "calc.exe",
-         "I have opened the Calculator for you!",
-         "Nimefungua Kikokotoo (Calculator) kwa ajili yako! | I have opened the Calculator for you!"),
-        (["chrome", "google chrome"], "chrome",
+        # Multi-word entries FIRST (longest keyword match priority)
+        (["microsoft store", "windows store", "ms store", "store app", "duka la windows"], "microsoft store",
+         "I have opened the Microsoft Store for you!",
+         "Nimefungua Microsoft Store! | I have opened the Microsoft Store for you!"),
+        (["microsoft edge", "ms edge"], "msedge",
+         "I have opened Microsoft Edge for you!",
+         "Nimefungua Microsoft Edge! | I have opened Microsoft Edge for you!"),
+        (["microsoft word", "ms word"], "word",
+         "I have opened Microsoft Word for you!",
+         "Nimefungua Microsoft Word! | I have opened Microsoft Word for you!"),
+        (["microsoft excel", "ms excel"], "excel",
+         "I have opened Microsoft Excel for you!",
+         "Nimefungua Microsoft Excel! | I have opened Microsoft Excel for you!"),
+        (["microsoft powerpoint", "ms powerpoint"], "powerpoint",
+         "I have opened PowerPoint for you!",
+         "Nimefungua PowerPoint! | I have opened PowerPoint for you!"),
+        (["google chrome"], "chrome",
          "I have opened Google Chrome for you!",
          "Nimefungua Google Chrome! | I have opened Google Chrome for you!"),
-        (["msedge", "edge", "microsoft edge"], "msedge",
+        (["visual studio code", "vs code", "vscode"], "code",
+         "I have opened Visual Studio Code for you!",
+         "Nimefungua VS Code! | I have opened Visual Studio Code for you!"),
+        (["file explorer", "windows explorer"], "explorer",
+         "I have opened File Explorer for you!",
+         "Nimefungua File Explorer! | I have opened File Explorer for you!"),
+        (["windows terminal"], "terminal",
+         "I have opened Windows Terminal for you!",
+         "Nimefungua Terminal! | I have opened Windows Terminal for you!"),
+        (["command prompt"], "cmd",
+         "I have opened the Command Prompt for you!",
+         "Nimefungua Command Prompt! | I have opened Command Prompt for you!"),
+        (["vlc player", "vlc media player"], "vlc",
+         "I have opened VLC Media Player for you!",
+         "Nimefungua VLC! | I have opened VLC Media Player for you!"),
+        (["ms paint"], "paint",
+         "I have opened MS Paint for you!",
+         "Nimefungua Paint! | I have opened MS Paint for you!"),
+        # Single-word entries follow
+        (["notepad", "notipadi"], "notepad",
+         "I have opened Notepad for you!",
+         "Nimefungua Notepad kwa ajili yako! | I have opened Notepad for you!"),
+        (["calculator", "kikokotoo", "calc"], "calc",
+         "I have opened the Calculator for you!",
+         "Nimefungua Kikokotoo (Calculator) kwa ajili yako! | I have opened the Calculator for you!"),
+        (["chrome"], "chrome",
+         "I have opened Google Chrome for you!",
+         "Nimefungua Google Chrome! | I have opened Google Chrome for you!"),
+        (["msedge", "edge"], "msedge",
          "I have opened Microsoft Edge for you!",
          "Nimefungua Microsoft Edge! | I have opened Microsoft Edge for you!"),
         (["firefox"], "firefox",
          "I have opened Firefox for you!",
          "Nimefungua Firefox! | I have opened Firefox for you!"),
-        (["vscode", "vs code", "visual studio code", "code"], "code",
+        (["code"], "code",
          "I have opened Visual Studio Code for you!",
          "Nimefungua VS Code! | I have opened Visual Studio Code for you!"),
         (["spotify"], "spotify",
@@ -159,33 +202,36 @@ def parse_local_command(prompt: str, language: str = "en") -> str | None:
         (["whatsapp"], "whatsapp",
          "I have opened WhatsApp for you!",
          "Nimefungua WhatsApp! | I have opened WhatsApp for you!"),
-        (["word", "ms word", "microsoft word"], "word",
+        (["word"], "word",
          "I have opened Microsoft Word for you!",
          "Nimefungua Microsoft Word! | I have opened Microsoft Word for you!"),
-        (["excel", "ms excel", "microsoft excel"], "excel",
+        (["excel"], "excel",
          "I have opened Microsoft Excel for you!",
          "Nimefungua Microsoft Excel! | I have opened Microsoft Excel for you!"),
-        (["powerpoint", "ppt", "ms powerpoint"], "powerpoint",
+        (["powerpoint", "ppt"], "powerpoint",
          "I have opened PowerPoint for you!",
          "Nimefungua PowerPoint! | I have opened PowerPoint for you!"),
-        (["vlc", "vlc player"], "vlc",
+        (["vlc"], "vlc",
          "I have opened VLC Media Player for you!",
          "Nimefungua VLC! | I have opened VLC Media Player for you!"),
-        (["paint", "ms paint"], "paint",
+        (["paint"], "paint",
          "I have opened MS Paint for you!",
          "Nimefungua Paint! | I have opened MS Paint for you!"),
-        (["terminal", "windows terminal"], "terminal",
+        (["terminal"], "terminal",
          "I have opened Windows Terminal for you!",
          "Nimefungua Terminal! | I have opened Windows Terminal for you!"),
         (["powershell"], "powershell",
          "I have opened PowerShell for you!",
          "Nimefungua PowerShell! | I have opened PowerShell for you!"),
-        (["cmd", "command prompt"], "cmd",
+        (["cmd"], "cmd",
          "I have opened the Command Prompt for you!",
          "Nimefungua Command Prompt! | I have opened Command Prompt for you!"),
-        (["explorer", "file explorer"], "explorer",
+        (["explorer"], "explorer",
          "I have opened File Explorer for you!",
          "Nimefungua File Explorer! | I have opened File Explorer for you!"),
+        (["store", "duka"], "microsoft store",
+         "I have opened the Microsoft Store for you!",
+         "Nimefungua Microsoft Store! | I have opened the Microsoft Store for you!"),
     ]
 
     # Extend app_table with dynamically discovered apps from the full PC scan
@@ -202,9 +248,23 @@ def parse_local_command(prompt: str, language: str = "en") -> str | None:
 
     for keywords, app_target, en_reply, sw_reply in app_table:
         if any(kw in clean_prompt for kw in keywords):
-            has_action = any(act in clean_prompt for act in launch_actions)
+            has_launch = any(act in clean_prompt for act in launch_actions)
+            has_close = any(act in clean_prompt for act in close_actions)
             is_exact = clean_prompt in keywords
-            if has_action or is_exact:
+            
+            # Check close actions FIRST (priority over launch)
+            if has_close:
+                result = execute_tool("close_app", {"app_name": app_target})
+                if result["success"]:
+                    close_en = en_reply.replace("opened", "closed")
+                    # Swahili: replace "Nimefungua" (I opened) with "Nimefunga" (I closed) and "opened" with "closed" in English part
+                    close_sw = sw_reply.replace("opened", "closed").replace("Nimefungua", "Nimefunga")
+                    return close_en if language == "en" else close_sw
+                else:
+                    return result["output"]
+            
+            # Then check launch actions
+            if has_launch or is_exact:
                 open_app_or_file(app_target)
                 return en_reply if language == "en" else sw_reply
 
@@ -236,6 +296,22 @@ def parse_local_command(prompt: str, language: str = "en") -> str | None:
                     return f"Nimefungua {target_name}! | I have launched {target_name} for you!"
             except Exception as e:
                 print(f"[LOCAL CMD]: Generic launch failed for '{target_name}': {e}")
+
+    # 2b. Generic "close/exit <anything>" catch-all
+    close_match = re.match(
+        r'^(?:close|exit|quit|stop|terminate|shutdown|funga|acha|simamisha|zima)\s+(.+)$',
+        clean_prompt
+    )
+    if close_match:
+        target_name = close_match.group(1).strip()
+        if target_name and len(target_name) <= 60:
+            result = execute_tool("close_app", {"app_name": target_name})
+            if result["success"]:
+                if language == "en":
+                    return f"I have closed {target_name} for you!"
+                return f"Nimefunga {target_name}! | I have closed {target_name} for you!"
+            else:
+                return result["output"]
 
     # 3. Browser / Google URL patterns
     browser_words = ["browser", "broswer", "broza", "internet", "google"]
@@ -279,6 +355,32 @@ def parse_local_command(prompt: str, language: str = "en") -> str | None:
             if language == "en":
                 return "You are very welcome Samson! Let me know if you need anything else. | You are very welcome Samson! Let me know if you need anything else."
             return "Karibu sana Samson! Kuna lingine la kukusaidia? | You are very welcome Samson! Is there anything else I can help you with?"
+
+    # 7. Identity & Boss / Creator queries (instant 0ms response, zero hallucination)
+    identity_triggers = [
+        "who is your boss", "who's your boss", "who is your creator", "who created you",
+        "who made you", "who built you", "who owns you", "what is your name",
+        "who are you", "who are u", "tell me about yourself",
+        "wewe ni nani", "bosi wako ni nani", "nani bosi wako", "bosi wako",
+        "nani aliyekuunda", "nani alikutengeneza", "jina lako nani", "wewe nani"
+    ]
+    if any(trig in clean_prompt for trig in identity_triggers):
+        if language == "en":
+            return "I am Nyota, an autonomous AI assistant built specifically for Samson Mwamloso. Samson is my boss and creator. | I am Nyota, an autonomous AI assistant built specifically for Samson Mwamloso. Samson is my boss and creator."
+        return "Mimi ni Nyota, msaidizi wako wa AI niliyetengenezwa maalum kwa ajili ya Samson Mwamloso. Samson ndiye bosi na muundaji wangu! | I am Nyota, an autonomous AI assistant built specifically for Samson Mwamloso. Samson is my boss and creator."
+
+    # 8. Installed Programs / Applications queries (instant 0ms response, zero token loops)
+    app_query_words = ["program", "programu", "app", "application", "software"]
+    action_words = ["list", "available", "avaible", "installed", "what", "show", "all", "orodha", "zilizopo"]
+    if any(w in clean_prompt for w in app_query_words) and any(a in clean_prompt for a in action_words):
+        if not any(w in clean_prompt for w in ["write", "create", "install", "download", "delete", "close"]):
+            from .executor import installed_apps
+            res = installed_apps()
+            out = res.get("output", "")
+            if out:
+                if language == "en":
+                    return f"{out} | {out}"
+                return f"Programu zilizopatikana kwenye kompyuta yako: {out} | {out}"
 
     return None
 
@@ -442,4 +544,5 @@ def query_nyota(prompt: str, conversation_id: str | None = None, language: str =
                     return "Samson, my API quota limit has been reached. Please try again in a minute."
                 return "Samson, nimefikia kikomo cha maswali kwa sasa. Tafadhali jaribu tena baada ya dakika moja. | Samson, my API quota limit has been reached. Please try again in a minute."
             return f"Error querying Nyota Engine: {ex}"
+
 

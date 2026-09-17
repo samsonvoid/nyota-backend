@@ -45,7 +45,7 @@ app.add_middleware(
 limiter = setup_security(app)
 
 # --- API Key ---
-register_api_key(os.getenv("API_SECRET_KEY", ""))
+register_api_key(os.getenv("API_SECRET_KEY", "nyota-dev-key-change-in-production"))
 
 # --- Routes ---
 app.include_router(chat_router)

@@ -40,23 +40,39 @@ class HybridMemoryService:
         self.supabase_url = os.getenv("SUPABASE_URL")
         self.supabase_key = os.getenv("SUPABASE_SERVICE_KEY")
         self.sync_enabled = os.getenv("SYNC_ENABLED", "true").lower() == "true"
-        self._lock = asyncio.Lock()
-        
-    async def initialize(self):
-        """Initialize local PostgreSQL connection"""
+        # Do NOT create asyncio.Lock here — it fails if no event loop exists at import time
+        self._lock = None
+        # Try synchronous connection immediately at creation time
+        self._connect_sync()
+
+    def _connect_sync(self) -> bool:
+        """Synchronous PostgreSQL connect — safe to call at any time, no event loop needed."""
         try:
-            self.local_conn = pg8000.connect(
+            conn = pg8000.connect(
                 host=os.getenv("LOCAL_DB_HOST", "localhost"),
                 port=int(os.getenv("LOCAL_DB_PORT", "5432")),
                 database=os.getenv("LOCAL_DB_NAME", "nyota_local"),
                 user=os.getenv("LOCAL_DB_USER", "postgres"),
                 password=os.getenv("LOCAL_DB_PASSWORD", "postgres"),
-                ssl_context=False
+                ssl_context=False,
+                timeout=5,
             )
+            self.local_conn = conn
             print("[HYBRID]: Local PostgreSQL connection established")
+            return True
         except Exception as e:
             print(f"[HYBRID]: Failed to connect to local PostgreSQL: {e}")
             print("[HYBRID]: Running in degraded mode (local memory unavailable)")
+            self.local_conn = None
+            return False
+
+    async def initialize(self):
+        """Async initialize — called from FastAPI startup. Re-uses sync connect."""
+        if not self.local_conn:
+            self._connect_sync()
+        if not self._lock:
+            self._lock = asyncio.Lock()
+
     
     async def close(self):
         """Close database connections"""
@@ -64,20 +80,28 @@ class HybridMemoryService:
             self.local_conn.close()
     
     def _execute_query(self, query: str, params: tuple = ()) -> List[tuple]:
-        """Execute a query and return results"""
+        """Execute a query and return results. Auto-reconnects if connection is lost."""
         if not self.local_conn:
-            return []
+            if not self._connect_sync():
+                return []
         try:
             cursor = self.local_conn.cursor()
             cursor.execute(query, params)
             if cursor.description:
-                return cursor.fetchall()
+                rows = cursor.fetchall()
+                cursor.close()
+                return rows
             cursor.close()
             self.local_conn.commit()
             return []
         except Exception as e:
             print(f"[HYBRID]: Query error: {e}")
-            self.local_conn.rollback()
+            try:
+                self.local_conn.rollback()
+            except Exception:
+                # Connection is dead — try to reconnect once
+                self.local_conn = None
+                self._connect_sync()
             return []
     
     # ============ LEARNED PATHS ============

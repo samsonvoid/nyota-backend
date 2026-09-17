@@ -9,6 +9,7 @@ import ollama
 import pyaudio
 import pyttsx3
 import threading
+from typing import Any
 from dataclasses import dataclass
 from fastapi import APIRouter, HTTPException, Depends, Request
 from pydantic import BaseModel, Field
@@ -23,6 +24,7 @@ router = APIRouter(prefix="/api", tags=["chat"])
 
 
 active_tts_engine = None
+active_tts_speaking = False
 active_tts_lock = threading.Lock()
 
 
@@ -60,11 +62,15 @@ class LocalQueryResult:
     approval_id: str | None = None
 
 def _extract_launch_app(message: str) -> str | None:
-    """Detect direct app launch requests like 'open msedge', 'launch chrome', 'fungua vscode'."""
+    """Detect direct app launch requests like 'open msedge', 'launch chrome', 'fungua vscode', 'play music'."""
     clean = message.strip().lower()
     clean = re.sub(r'[?!.,;:_#@*()\-+]', ' ', clean).strip()
+
+    if clean in {"play music", "play some music", "play song", "play songs", "cheza muziki", "open music", "open spotify"}:
+        return "music"
+
     match = re.match(
-        r'^(?:launch|open|start|run|fire up|fungua|washa|anzisha)\s+([a-zA-Z0-9_\- ]+)$',
+        r'^(?:launch|open|start|run|fire up|fungua|washa|anzisha|play)\s+([a-zA-Z0-9_\- ]+)$',
         clean
     )
     if match:
@@ -74,8 +80,31 @@ def _extract_launch_app(message: str) -> str | None:
             return "msedge"
         if target in {"folder", "project"}:
             return "explorer"
+        if target in {"music", "song", "songs", "muziki"}:
+            return "music"
         if target and len(target.split()) <= 3 and target not in non_apps:
             return target
+    return None
+
+
+def _extract_close_app(message: str) -> tuple[str, dict[str, Any]] | None:
+    """Detect direct app/window close requests like 'close window', 'close edge', 'funga chrome'."""
+    clean = message.strip().lower()
+    clean = re.sub(r'[?!.,;:_#@*()\-+]', ' ', clean).strip()
+
+    if clean in {"close window", "close the window", "close active window", "close current window", "funga dirisha", "funga window", "close it"}:
+        return ("close_window", {})
+
+    match = re.match(
+        r'^(?:close|exit|terminate|kill|shut down|funga|zima)\s+([a-zA-Z0-9_\- ]+)$',
+        clean
+    )
+    if match:
+        target = match.group(1).strip()
+        if target in {"window", "the window", "active window", "current window", "dirisha"}:
+            return ("close_window", {})
+        if target and len(target.split()) <= 3:
+            return ("close_app", {"app_name": target})
     return None
 
 
@@ -84,18 +113,24 @@ def _check_direct_tool(message: str) -> str | None:
     clean = message.strip().lower()
     clean = re.sub(r'[?!.,;:_#@*()\-+]', ' ', clean).strip()
 
-    # Check for installed tools / applications query
+    # 1. Check for installed applications / desktop programs query
+    app_query_words = ["program", "programu", "app", "application", "software"]
+    action_words = ["list", "available", "avaible", "installed", "what", "show", "all", "orodha", "zilizopo"]
+    if any(w in clean for w in app_query_words) and any(a in clean for a in action_words):
+        if not any(w in clean for w in ["write", "create", "install", "download", "delete", "close", "kill"]):
+            res = execute_tool("installed_apps", {})
+            return res.get("output", "Could not query installed applications.")
+
+    # 2. Check for dev tools query (git, node, python, docker)
     tool_keywords = [
-        "list the all application", "list all application", "list application",
         "list all tools", "list tools", "available tools", "installed tools",
-        "installed applications", "what tools do i have", "programs installed",
-        "orodha ya programu", "programu zilizopo"
+        "what tools do i have", "dev tools", "developer tools", "programming tools"
     ]
     if any(kw in clean for kw in tool_keywords):
         res = execute_tool("installed_tools", {})
         return res.get("output", "Could not query installed tools.")
 
-    # Check for system hardware stats
+    # 3. Check for system hardware stats
     sys_keywords = ["system info", "system status", "pc info", "hardware info", "hali ya kompyuta"]
     if any(kw in clean for kw in sys_keywords):
         res = execute_tool("system_info", {})
@@ -139,19 +174,39 @@ def query_ollama_local(message: str, language: str = "en") -> LocalQueryResult |
             return LocalQueryResult(reply=local_reply)
 
         sys_prompt = (
-            "You are Nyota Assistant, personal AI assistant for Samson Mwamloso running on Windows.\n"
-            "Be concise, direct, and helpful.\n"
-            "You have access to tools defined in executor.py.\n"
-            "CRITICAL TOOL INSTRUCTION:\n"
-            "When the user asks to open or launch an application (such as Edge, Chrome, VS Code, Notepad, Calculator, Word, Excel, Spotify, etc.), "
-            "you MUST output ONLY a JSON object in this exact format and NOTHING else:\n"
-            '{"action":"execute","tool":"launch_app","arguments":{"app_name":"<app_name>"}}\n'
-            "Examples:\n"
-            'User: "open msedge" -> {"action":"execute","tool":"launch_app","arguments":{"app_name":"msedge"}}\n'
-            'User: "launch chrome" -> {"action":"execute","tool":"launch_app","arguments":{"app_name":"chrome"}}\n'
-            'User: "fungua vscode" -> {"action":"execute","tool":"launch_app","arguments":{"app_name":"code"}}\n'
-            "Do NOT output markdown blocks, code explanations, or conversational filler when invoking a tool.\n"
-            "For regular questions and conversation that do not require a tool, reply with plain text."
+            "You are Nyota, an autonomous AI assistant built specifically for Samson Mwamloso running directly on his Windows PC.\n"
+            "Samson Mwamloso is your creator, engineer, and boss. You were NOT created by OpenAI, Microsoft, or Google. NEVER say you were created by OpenAI.\n"
+            "You have REAL tools that execute on this computer. NEVER say 'as an AI I don't have access' — "
+            "you DO have access through your tools.\n"
+            "NEVER refuse a coding, scripting, or file request — use write_file to save scripts to disk.\n\n"
+            "TOOL USAGE RULES:\n"
+            "Output ONLY raw JSON when calling a tool. No markdown, no explanation.\n\n"
+            "Tool: launch_app — open any app or website\n"
+            '{"action":"execute","tool":"launch_app","arguments":{"app_name":"<app>"}}\n\n'
+            "Tool: close_app — close a named running app\n"
+            '{"action":"execute","tool":"close_app","arguments":{"app_name":"<app>"}}\n\n'
+            "Tool: close_window — close the currently active/foreground window\n"
+            '{"action":"execute","tool":"close_window","arguments":{}}\n\n'
+            "Tool: installed_apps — list installed desktop programs and apps on Samson's PC\n"
+            '{"action":"execute","tool":"installed_apps","arguments":{}}\n\n'
+            "Tool: search_file — find files by name inside workspace folders\n"
+            '{"action":"execute","tool":"search_file","arguments":{"name":"<filename>"}}\n\n'
+            "Tool: list_files — list contents of a folder (use path like C:\\\\Users\\\\samson)\n"
+            '{"action":"execute","tool":"list_files","arguments":{"path":"<folder_path>"}}\n\n'
+            "Tool: write_file — WRITE and SAVE a script or file to disk\n"
+            '{"action":"execute","tool":"write_file","arguments":{"path":"<file_path>","content":"<full_code_here>"}}\n\n'
+            "Tool: run_command — run a shell/PowerShell command (requires user approval)\n"
+            '{"action":"execute","tool":"run_command","arguments":{"command":"<cmd>"}}\n\n'
+            "EXAMPLES:\n"
+            'User: "list available programs" -> {"action":"execute","tool":"installed_apps","arguments":{}}\n'
+            'User: "who is your boss" -> Plain text: "Samson Mwamloso is my creator and boss. I was built specifically to assist him."\n'
+            'User: "write a bubble sort script" -> {"action":"execute","tool":"write_file","arguments":{"path":"bubble_sort.py","content":"def bubble_sort(arr):\\n    ..."}}\n'
+            'User: "list my user folder" -> {"action":"execute","tool":"list_files","arguments":{"path":"C:\\\\Users\\\\samson"}}\n'
+            'User: "find microsoft store" -> {"action":"execute","tool":"launch_app","arguments":{"app_name":"microsoft store"}}\n'
+            'User: "open notepad" -> {"action":"execute","tool":"launch_app","arguments":{"app_name":"notepad"}}\n'
+            'User: "close edge" -> {"action":"execute","tool":"close_app","arguments":{"app_name":"msedge"}}\n'
+            'User: "play music" -> {"action":"execute","tool":"launch_app","arguments":{"app_name":"music"}}\n'
+            "For regular conversation (greetings, questions not requiring tools) reply with plain text only."
         )
         if language == "sw":
             sys_prompt += "\nJibu kwa Kiswahili fasaha kwa maongezi ya kawaida."
@@ -168,9 +223,11 @@ def query_ollama_local(message: str, language: str = "en") -> LocalQueryResult |
                 {"role": "user", "content": message}
             ],
             options={
-                "temperature": 0.1,
+                "temperature": 0.2,
                 "top_p": 0.9,
-                "num_predict": 120,
+                "repeat_penalty": 1.2,
+                "repeat_last_n": 64,
+                "num_predict": 512,
             },
             keep_alive="10m",
         )
@@ -182,9 +239,72 @@ def query_ollama_local(message: str, language: str = "en") -> LocalQueryResult |
         if not tool_request:
             return LocalQueryResult(reply=ai_reply)
 
-        tool_name = tool_request.get("tool")
+        tool_name = tool_request.get("tool", "")
         arguments = tool_request.get("arguments", {})
-        if not isinstance(tool_name, str) or not isinstance(arguments, dict):
+
+        # Qwen sometimes double-nests: {"arguments": {"arguments": {"app_name": "..."}}}
+        if isinstance(arguments, dict) and "arguments" in arguments and isinstance(arguments.get("arguments"), dict):
+            arguments = arguments["arguments"]
+
+        # Qwen sometimes mixes up tool names for close commands — remap them
+        _TOOL_ALIASES = {
+            "close_window": "close_window",
+            "close_app":    "close_app",
+            "kill_app":      "close_app",
+            "quit_app":      "close_app",
+            "terminate_app": "close_app",
+            "stop_app":      "close_app",
+            "launch_app":    "launch_app",
+            "open_app":      "launch_app",
+            "start_app":     "launch_app",
+            "locate_app":    "launch_app",    # "locate microsoft store" → launch_app
+            "search_file":   "search_file",
+            "find_file":     "search_file",
+            "locate_file":   "search_file",
+            "list_files":    "list_files",
+            "list_directory": "list_files",
+            "list_dir":      "list_files",
+            "write_file":    "write_file",
+            "create_file":   "write_file",
+            "save_file":     "write_file",
+            "write_code":    "write_file",
+            "create_script": "write_file",
+            "installed_apps": "installed_apps",
+            "list_apps":     "installed_apps",
+            "list_programs": "installed_apps",
+            "installed_programs": "installed_apps",
+            "available_programs": "installed_apps",
+            "run_command":   "run_command",
+            "execute_command": "run_command",
+            "run_script":    "run_command",
+            "shell_command": "run_command",
+        }
+        tool_name = _TOOL_ALIASES.get(tool_name, tool_name)
+
+        # If Qwen returns launch_app with a "close" intent in the original message, fix it
+        if tool_name == "launch_app":
+            raw_msg = message.strip().lower()
+            if any(w in raw_msg for w in ["close", "exit", "quit", "funga", "zima", "kill"]):
+                app_arg = arguments.get("app_name") or arguments.get("name") or ""
+                if app_arg:
+                    # Redirect to close_app instead of launch_app
+                    tool_name = "close_app"
+                    arguments = {"app_name": app_arg}
+                    print(f"[OLLAMA FIX]: Redirected launch_app -> close_app for '{raw_msg}'")
+
+        # If Qwen uses search_file when user says "locate/find <app>" — redirect to launch_app
+        if tool_name == "search_file":
+            raw_msg = message.strip().lower()
+            app_hint = any(w in raw_msg for w in ["store", "app", "program", "application", "software"])
+            open_hint = any(w in raw_msg for w in ["locate", "find", "open", "fungua"])
+            if open_hint and app_hint:
+                q = arguments.get("name") or arguments.get("query") or ""
+                if q:
+                    tool_name = "launch_app"
+                    arguments = {"app_name": q}
+                    print(f"[OLLAMA FIX]: Redirected search_file -> launch_app for '{raw_msg}'")
+
+        if not isinstance(tool_name, str) or not tool_name:
             return LocalQueryResult(reply="I could not validate that tool request. Please try again.")
 
         tool_definition = next(
@@ -196,13 +316,20 @@ def query_ollama_local(message: str, language: str = "en") -> LocalQueryResult |
         if tool_definition["requires_approval"]:
             approval = approval_store.create(tool_name, arguments)
             return LocalQueryResult(
-                reply=f"Approval is required before I use {tool_name}. Please approve request {approval.approval_id}.",
+                reply=f"Samson, I need your approval before I run: {tool_name}. Please approve request {approval.approval_id} in the HUD.",
                 approval_id=approval.approval_id,
             )
 
         print(f"[TOOL]: Executing {tool_name} with {arguments} via executor.py")
         tool_result = execute_tool(tool_name, arguments, approved=True)
-        return LocalQueryResult(reply=tool_result.get("output", f"{tool_name} completed."))
+        output = tool_result.get("output", f"{tool_name} completed.")
+
+        # For write_file: give Nyota a voice-friendly completion message
+        if tool_name == "write_file" and tool_result.get("success"):
+            file_name = arguments.get("path", "the file")
+            output = f"Done! I have written and saved {file_name} for you. You can find it in the chat console."
+
+        return LocalQueryResult(reply=output)
     except Exception as e:
         print(f"[OLLAMA ERROR]: Local Ollama failed ({e}). Falling back to Gemini...")
         return None
@@ -238,7 +365,7 @@ def calculate_rms(audio_data: bytes) -> float:
 
 
 def _sanitize_for_voice(text: str) -> str:
-    """Prepare text for natural SAPI5 TTS: strip file paths, raw JSON syntax, and markdown."""
+    """Prepare text for natural SAPI5 TTS: strip code blocks, file paths, raw JSON syntax, and markdown."""
     clean = text.strip()
 
     # 1. If text is a raw JSON dict, convert to friendly natural speech
@@ -252,20 +379,46 @@ def _sanitize_for_voice(text: str) -> str:
         except Exception:
             pass
 
-    # 2. If text contains "from C:\..." or any file path, strip it cleanly
+    # 2a. Handle CLOSED fenced code blocks (```...```)
+    if "```" in clean:
+        has_intro = bool(re.match(r'^[^\`]{10,}', clean))
+        clean = re.sub(r'```[\w]*[\r\n]+[\s\S]*?```', '', clean).strip()
+        if not clean:
+            return "I have generated the code in your chat console."
+        elif not has_intro:
+            clean = "I have provided the code in your console. " + clean
+
+    # 2b. Handle UNCLOSED fenced code blocks (code was cut off mid-generation)
+    # e.g. "```python\ndef foo():\n    ..." — no closing fence
+    if "```" in clean:
+        # Everything from the opening fence to end is raw code — strip it
+        clean = re.sub(r'```[\w]*[\r\n][\s\S]*$', '', clean).strip()
+        if not clean:
+            return "I have generated the code in your chat console."
+        clean = clean + " The full code is in your chat window."
+
+    # 3. Strip raw Windows file paths (e.g. C:\Program Files\...)
     clean = re.sub(r'from\s+[A-Za-z]:\\[^\n\r.]+\.[a-zA-Z0-9]+', '', clean, flags=re.IGNORECASE)
     clean = re.sub(r'[A-Za-z]:\\[^\n\r.]+\.[a-zA-Z0-9]+', '', clean, flags=re.IGNORECASE)
 
-    # 3. Clean markdown code fences and symbols
-    clean = re.sub(r'```[a-zA-Z]*', '', clean)
+    # 4. Clean markdown formatting symbols
     clean = clean.replace('`', '').replace('*', '').replace('#', '')
     clean = re.sub(r'\s+', ' ', clean).strip()
+
+    # 5. Shorten excessively long code dumps if code wasn't wrapped in fences
+    code_keywords = ["def ", "import ", "class ", "return ", "const ", "function ", "print(", "#include", "int main(", "void ", "typedef struct", "struct "]
+    if len(clean) > 220 and any(keyword in clean for keyword in code_keywords):
+        first_sentence = clean.split('.')[0]
+        if len(first_sentence) < 120 and any(w in first_sentence.lower() for w in ["here", "script", "code", "created", "wrote", "saved", "program", "queue", "sort"]):
+            clean = first_sentence + ". The full code is available in your chat window where you can save or copy it."
+        else:
+            clean = "I have written the requested script and code for you in the console."
 
     return clean
 
 
 def speak_async(text: str):
-    global active_tts_engine
+    global active_tts_engine, active_tts_speaking
     try:
         if "|" in text:
             text_to_speak = text.split("|")[1].strip()
@@ -275,6 +428,9 @@ def speak_async(text: str):
         text_to_speak = _sanitize_for_voice(text_to_speak)
         if not text_to_speak:
             return
+
+        with active_tts_lock:
+            active_tts_speaking = True
 
         # Re-initialize pyttsx3 inside the thread
         engine = pyttsx3.init()
@@ -293,6 +449,7 @@ def speak_async(text: str):
     finally:
         with active_tts_lock:
             active_tts_engine = None
+            active_tts_speaking = False
 
 
 def persist_messages(conversation_id: str, user_message: str, assistant_message: str):
@@ -337,10 +494,19 @@ def persist_messages(conversation_id: str, user_message: str, assistant_message:
             print(f"[CHAT]: Hybrid memory fallback also failed: {fallback_error}")
 
 
+@router.get("/tts-status")
+def get_tts_status(_=Depends(validate_api_key)):
+    global active_tts_speaking
+    with active_tts_lock:
+        speaking = active_tts_speaking
+    return {"is_speaking": speaking}
+
+
 @router.post("/interrupt")
 def interrupt_speech(_=Depends(validate_api_key)):
-    global active_tts_engine
+    global active_tts_engine, active_tts_speaking
     with active_tts_lock:
+        active_tts_speaking = False
         if active_tts_engine:
             try:
                 active_tts_engine.stop()
@@ -362,13 +528,19 @@ async def chat(request: Request, body: ChatRequest, _=Depends(validate_api_key))
     try:
         language = body.language or "en"
 
-        # 1. Direct tool execution via executor.py for launch & tool requests
+        # 1. Direct tool execution via executor.py for launch, close & tool requests
         target_app = _extract_launch_app(body.message)
+        target_close = _extract_close_app(body.message)
         direct_tool_reply = _check_direct_tool(body.message)
         if target_app:
             print(f"[EXECUTOR]: Direct launch detected for '{target_app}' via executor.py")
             res = execute_tool("launch_app", {"app_name": target_app}, approved=True)
             reply = res.get("output", f"Opening {target_app.title()}.")
+        elif target_close:
+            tool_name, tool_args = target_close
+            print(f"[EXECUTOR]: Direct close detected ({tool_name}, {tool_args}) via executor.py")
+            res = execute_tool(tool_name, tool_args, approved=True)
+            reply = res.get("output", "Closed.")
         elif direct_tool_reply:
             print(f"[EXECUTOR]: Direct tool query handled via executor.py")
             reply = direct_tool_reply
@@ -592,13 +764,19 @@ def voice_chat(request: Request, body: VoiceChatRequest, _=Depends(validate_api_
                     is_silence=True
                 )
 
-        # 1. Direct tool execution via executor.py for voice launch & tool requests
+        # 1. Direct tool execution via executor.py for voice launch, close & tool requests
         target_app = _extract_launch_app(user_query)
+        target_close = _extract_close_app(user_query)
         direct_tool_reply = _check_direct_tool(user_query)
         if target_app:
             print(f"[EXECUTOR]: Direct voice launch detected for '{target_app}' via executor.py")
             res = execute_tool("launch_app", {"app_name": target_app}, approved=True)
             reply = res.get("output", f"Opening {target_app.title()}.")
+        elif target_close:
+            tool_name, tool_args = target_close
+            print(f"[EXECUTOR]: Direct voice close detected ({tool_name}, {tool_args}) via executor.py")
+            res = execute_tool(tool_name, tool_args, approved=True)
+            reply = res.get("output", "Closed.")
         elif direct_tool_reply:
             print(f"[EXECUTOR]: Direct voice tool query handled via executor.py")
             reply = direct_tool_reply

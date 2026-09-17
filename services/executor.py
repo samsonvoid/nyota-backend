@@ -61,6 +61,11 @@ TOOLS = {
         description="Check selected development tools available on the Windows PATH.",
         requires_approval=False,
     ),
+    "installed_apps": ToolDefinition(
+        name="installed_apps",
+        description="List installed desktop applications and programs on this Windows PC.",
+        requires_approval=False,
+    ),
     "search_file": ToolDefinition(
         name="search_file",
         description="Search for a filename inside an approved workspace only.",
@@ -80,6 +85,26 @@ TOOLS = {
         name="launch_app",
         description="Launch a desktop application like msedge, chrome, code, notepad, or calc.",
         requires_approval=False,
+    ),
+    "close_app": ToolDefinition(
+        name="close_app",
+        description="Close a running desktop application like msedge, chrome, code, notepad, or calc.",
+        requires_approval=False,
+    ),
+    "close_window": ToolDefinition(
+        name="close_window",
+        description="Close the currently active window or a specified application window.",
+        requires_approval=False,
+    ),
+    "write_file": ToolDefinition(
+        name="write_file",
+        description="Write or create a script or text file inside an approved workspace.",
+        requires_approval=False,
+    ),
+    "run_command": ToolDefinition(
+        name="run_command",
+        description="Execute a shell command or script on Windows. Requires approval before running.",
+        requires_approval=True,
     ),
 }
 
@@ -298,7 +323,10 @@ def read_file(path: str) -> dict[str, Any]:
         if file_path.name.lower() in {".env", ".env.local", "credentials.md"} or file_path.suffix.lower() in {".key", ".pem"}:
             raise PermissionError("Reading secret or credential files is not allowed")
         content = file_path.read_text(encoding="utf-8", errors="replace")
-        return _finish("read_file", arguments, started_at, True, content)
+        result = _finish("read_file", arguments, started_at, True, content)
+        result["file_path"] = str(file_path)
+        result["filename"] = file_path.name
+        return result
     except (OSError, PermissionError, ValueError) as error:
         return _finish("read_file", arguments, started_at, False, f"Read file error: {error}")
 
@@ -347,25 +375,101 @@ def installed_tools() -> dict[str, Any]:
         return _finish("installed_tools", arguments, started_at, False, f"Installed tools error: {error}")
 
 
-def search_file(name: str, path: str | None = None, limit: int = 50) -> dict[str, Any]:
+def installed_apps() -> dict[str, Any]:
+    """List installed user-facing desktop applications on this Windows PC without repeating names."""
+    started_at = time.perf_counter()
+    arguments: dict[str, Any] = {}
+    try:
+        common_priority = [
+            ("Google Chrome", ["chrome"]),
+            ("Visual Studio Code", ["code", "vscode"]),
+            ("Microsoft Edge", ["msedge", "edge"]),
+            ("Mozilla Firefox", ["firefox"]),
+            ("Brave Browser", ["brave"]),
+            ("Microsoft Store", ["microsoft store", "store"]),
+            ("Notepad", ["notepad"]),
+            ("Command Prompt", ["cmd"]),
+            ("Windows PowerShell", ["powershell"]),
+            ("Windows Terminal", ["terminal", "wt"]),
+            ("Calculator", ["calc", "calculator"]),
+            ("VLC Media Player", ["vlc"]),
+            ("Spotify", ["spotify"]),
+            ("Discord", ["discord"]),
+            ("Telegram", ["telegram"]),
+            ("WhatsApp", ["whatsapp"]),
+            ("Microsoft Word", ["word", "winword"]),
+            ("Microsoft Excel", ["excel"]),
+            ("Microsoft PowerPoint", ["powerpoint", "powerpnt"]),
+            ("MS Paint", ["paint", "mspaint"]),
+            ("File Explorer", ["explorer"]),
+            ("Burp Suite", ["burp", "burpsuite"]),
+            ("Antigravity", ["antigravity"]),
+            ("Settings", ["settings"]),
+            ("Camera", ["camera"]),
+            ("Photos", ["photos"]),
+        ]
+
+        found_names: list[str] = []
+        for display_name, keys in common_priority:
+            for k in keys:
+                if k in DYNAMIC_APP_MAP or k in UWP_APPS or shutil.which(k):
+                    if display_name not in found_names:
+                        found_names.append(display_name)
+                    break
+
+        # Also add any clean discovered apps from DYNAMIC_APP_MAP
+        garbage = {"17.0.17+10", "add", "addin", "additional", "address", "application", "audio", "bang", "bootstrap", "build", "changer", "cli", "clicktorun", "c++"}
+        for k in sorted(DYNAMIC_APP_MAP.keys()):
+            if len(k) >= 4 and k not in garbage and not any(k in keys for _, keys in common_priority):
+                clean_title = k.replace("_", " ").replace("-", " ").title()
+                if clean_title not in found_names and len(found_names) < 30:
+                    found_names.append(clean_title)
+
+        summary = f"Installed applications found on your PC ({len(found_names)}): {', '.join(found_names)}."
+        return _finish("installed_apps", arguments, started_at, True, summary)
+    except Exception as error:
+        return _finish("installed_apps", arguments, started_at, False, f"Installed apps error: {error}")
+
+
+def search_file(name: str = "", path: str | None = None, limit: int = 50, **kwargs: Any) -> dict[str, Any]:
     """Find matching filenames under one approved workspace."""
     started_at = time.perf_counter()
-    arguments = {"name": name, "path": path, "limit": limit}
+    search_query = (
+        name
+        or kwargs.get("file_name")
+        or kwargs.get("filename")
+        or kwargs.get("query")
+        or kwargs.get("pattern")
+        or kwargs.get("search_term")
+        or ""
+    ).strip()
+    arguments = {"name": search_query, "path": path, "limit": limit}
     try:
-        if not name or len(name) > 160:
-            raise ValueError("A filename or pattern is required")
+        if not search_query:
+            raise ValueError("A filename or search query is required")
         if limit < 1 or limit > 200:
             raise ValueError("limit must be between 1 and 200")
         workspace = _resolve_workspace(path)
         matches: list[str] = []
-        for entry in workspace.rglob(name):
-            if any(part in {".git", "node_modules", "__pycache__", ".venv"} for part in entry.parts):
-                continue
-            matches.append(str(entry.relative_to(workspace)))
+        lowered_query = search_query.lower()
+        for root, dirs, files in os.walk(workspace):
+            dirs[:] = [d for d in dirs if d not in {".git", "node_modules", "__pycache__", ".venv", "dist", "build"}]
+            for fn in files:
+                if lowered_query in fn.lower():
+                    rel = os.path.relpath(os.path.join(root, fn), workspace)
+                    matches.append(rel)
+                    if len(matches) >= limit:
+                        break
             if len(matches) >= limit:
                 break
         matches.sort()
-        output = "\n".join(matches) if matches else "No matching files found."
+        if matches:
+            top_names = [os.path.basename(m) for m in matches[:5]]
+            output = f"Found {len(matches)} matching file(s): {', '.join(top_names)}."
+            if len(matches) > 5:
+                output += f" and {len(matches) - 5} more."
+        else:
+            output = f"No matching files found for '{search_query}' in the workspace."
         return _finish("search_file", arguments, started_at, True, output)
     except (OSError, PermissionError, ValueError) as error:
         return _finish("search_file", arguments, started_at, False, f"File search error: {error}")
@@ -412,6 +516,93 @@ def frontend_build(path: str | None = None) -> dict[str, Any]:
         return _finish("frontend_build", arguments, started_at, completed.returncode == 0, output)
     except (OSError, PermissionError, ValueError, subprocess.TimeoutExpired) as error:
         return _finish("frontend_build", arguments, started_at, False, f"Frontend build error: {error}")
+
+
+def write_file(path: str, content: str, **kwargs: Any) -> dict[str, Any]:
+    """Write or create a script/text file inside an approved workspace."""
+    started_at = time.perf_counter()
+    # Accept common argument aliases from Ollama/Gemini
+    path = path or kwargs.get("file_path") or kwargs.get("filename") or kwargs.get("name") or ""
+    content = content or kwargs.get("code") or kwargs.get("text") or kwargs.get("body") or ""
+    arguments = {"path": path, "content_length": len(content)}
+    try:
+        if not path:
+            raise ValueError("A file path is required")
+        if not content:
+            raise ValueError("Content to write cannot be empty")
+
+        file_path = Path(path).expanduser()
+        # If not absolute, place it in the first allowed workspace root
+        if not file_path.is_absolute():
+            file_path = _allowed_roots()[0] / file_path
+
+        file_path = file_path.resolve()
+        # Validate against allowed workspace roots
+        allowed = False
+        for root in _allowed_roots():
+            try:
+                file_path.relative_to(root)
+                allowed = True
+                break
+            except ValueError:
+                continue
+        if not allowed:
+            raise PermissionError(f"Path '{file_path}' is outside approved workspace roots")
+
+        # Block overwriting secret files
+        if file_path.name.lower() in {".env", ".env.local", "credentials.md"} or file_path.suffix.lower() in {".key", ".pem"}:
+            raise PermissionError("Writing to secret or credential files is not allowed")
+
+        # Create parent directories if needed
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_path.write_text(content, encoding="utf-8")
+
+        short_name = file_path.name
+        lines = content.count("\n") + 1
+        result = _finish("write_file", arguments, started_at, True,
+                         f"Successfully wrote {lines} line(s) to '{short_name}'. File saved at: {file_path}")
+        result["file_path"] = str(file_path)
+        result["filename"] = short_name
+        return result
+    except (OSError, PermissionError, ValueError) as error:
+        return _finish("write_file", arguments, started_at, False, f"Write file error: {error}")
+
+
+def run_command(command: str, path: str | None = None, **kwargs: Any) -> dict[str, Any]:
+    """Execute a shell command on Windows after approval. Requires requires_approval=True."""
+    started_at = time.perf_counter()
+    command = command or kwargs.get("cmd") or kwargs.get("shell") or kwargs.get("script") or ""
+    arguments = {"command": command, "path": path}
+    try:
+        if not command:
+            raise ValueError("A command string is required")
+        if len(command) > 500:
+            raise ValueError("Command is too long (max 500 chars)")
+
+        # Resolve optional working directory
+        cwd = None
+        if path:
+            try:
+                cwd = str(_resolve_workspace(path))
+            except (ValueError, PermissionError):
+                cwd = None
+
+        completed = subprocess.run(
+            command,
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=DEFAULT_TIMEOUT_SECONDS,
+            cwd=cwd,
+        )
+        output = (completed.stdout or "") + (completed.stderr or "")
+        success = completed.returncode == 0
+        return _finish("run_command", arguments, started_at, success,
+                       output or f"Command exited with code {completed.returncode}")
+    except subprocess.TimeoutExpired:
+        return _finish("run_command", arguments, started_at, False, "Command timed out after 30 seconds")
+    except (OSError, PermissionError, ValueError) as error:
+        return _finish("run_command", arguments, started_at, False, f"Run command error: {error}")
 
 
 APP_ALIASES: dict[str, list[str]] = {
@@ -499,11 +690,22 @@ UWP_APPS: dict[str, str] = {
     "webcam": "microsoft.windows.camera:",
     "picha": "microsoft.windows.camera:",
     "settings": "ms-settings:",
+    "windows settings": "ms-settings:",
     "store": "ms-windows-store:",
+    "microsoft store": "ms-windows-store:",
+    "windows store": "ms-windows-store:",
+    "duka": "ms-windows-store:",          # Swahili for store
     "photos": "ms-photos:",
+    "picha gallery": "ms-photos:",
     "clock": "ms-clock:",
     "alarm": "ms-clock:",
     "alarms": "ms-clock:",
+    "maps": "bingmaps:",
+    "weather": "bingweather:",
+    "news": "bingnews:",
+    "calendar": "outlookcal:",
+    "mail": "outlookmail:",
+    "calculator app": "ms-calculator:",
 }
 
 
@@ -691,17 +893,35 @@ def _find_windows_app(app_name: str) -> str | None:
     return None
 
 
-def launch_app(app_name: str) -> dict[str, Any]:
-    """Launch an application or UWP app with clean natural speech response."""
+def launch_app(app_name: str = "", **kwargs: Any) -> dict[str, Any]:
+    """Launch an application, website, or UWP app with clean natural speech response."""
     started_at = time.perf_counter()
-    arguments = {"app_name": app_name}
+    target_app = (app_name or kwargs.get("name") or kwargs.get("target") or kwargs.get("app") or "").strip()
+    arguments = {"app_name": target_app}
     try:
-        if not app_name:
+        if not target_app:
             raise ValueError("Application name is required")
 
-        target_path = _find_windows_app(app_name)
+        clean_lower = target_app.lower()
+
+        # 1. URL / Website opening support
+        if clean_lower.startswith(("http://", "https://", "www.")) or any(clean_lower.endswith(ext) for ext in [".com", ".org", ".net", ".io", ".dev", ".app", ".co"]):
+            import webbrowser
+            url = target_app if target_app.startswith("http") else f"https://{target_app}"
+            webbrowser.open(url)
+            return _finish("launch_app", arguments, started_at, True, f"Opening {clean_lower} in your browser.")
+
+        # 2. Music / Media fallback (if Spotify not installed, open YouTube Music)
+        if clean_lower in {"spotify", "music", "song", "songs", "muziki", "media"}:
+            found_music = _find_windows_app("spotify")
+            if not found_music:
+                import webbrowser
+                webbrowser.open("https://music.youtube.com")
+                return _finish("launch_app", arguments, started_at, True, "Opening YouTube Music in your browser.")
+
+        target_path = _find_windows_app(target_app)
         if not target_path:
-            raise ValueError(f"Could not locate '{app_name}' on this machine. Make sure it is installed.")
+            raise ValueError(f"Could not locate '{target_app}' on this machine. Make sure it is installed.")
 
         # Format clean display name for voice
         display_names = {
@@ -709,9 +929,10 @@ def launch_app(app_name: str) -> dict[str, Any]:
             "msedge": "Microsoft Edge", "edge": "Microsoft Edge",
             "chrome": "Google Chrome", "calc": "Calculator", "calculator": "Calculator",
             "notepad": "Notepad", "camera": "Camera", "webcam": "Camera",
-            "settings": "Settings", "word": "Word", "excel": "Excel", "spotify": "Spotify"
+            "settings": "Settings", "word": "Word", "excel": "Excel", "spotify": "Spotify",
+            "vlc": "VLC Media Player", "music": "Music"
         }
-        app_display = display_names.get(app_name.lower().strip(), app_name.title())
+        app_display = display_names.get(clean_lower, target_app.title())
 
         # Handle UWP Protocol URI (e.g. microsoft.windows.camera:, ms-settings:)
         if target_path.endswith(":") or target_path.startswith(("microsoft.", "ms-")):
@@ -723,7 +944,7 @@ def launch_app(app_name: str) -> dict[str, Any]:
             return _finish("launch_app", arguments, started_at, True, f"Opening {app_display}.")
 
         if not os.path.exists(target_path):
-            raise ValueError(f"Could not locate '{app_name}' on this machine. Make sure it is installed.")
+            raise ValueError(f"Could not locate '{target_app}' on this machine. Make sure it is installed.")
 
         if os.name == "nt":
             try:
@@ -735,7 +956,107 @@ def launch_app(app_name: str) -> dict[str, Any]:
 
         return _finish("launch_app", arguments, started_at, True, f"Opening {app_display}.")
     except (OSError, ValueError) as error:
-        return _finish("launch_app", arguments, started_at, False, f"Could not launch {app_name}. {error}")
+        return _finish("launch_app", arguments, started_at, False, f"Could not launch {target_app}. {error}")
+
+
+def close_window(app_name: str = "", **kwargs: Any) -> dict[str, Any]:
+    """Close the active foreground window or a specified application window."""
+    started_at = time.perf_counter()
+    target = (app_name or kwargs.get("window_name") or kwargs.get("name") or kwargs.get("target") or "").strip()
+    arguments = {"app_name": target}
+
+    if target and target.lower() not in {"window", "the window", "active window", "current window", "dirisha"}:
+        return close_app(target)
+
+    try:
+        if os.name == "nt":
+            import ctypes
+            user32 = ctypes.windll.user32
+            hwnd = user32.GetForegroundWindow()
+            if hwnd:
+                length = user32.GetWindowTextLengthW(hwnd)
+                buff = ctypes.create_unicode_buffer(length + 1)
+                user32.GetWindowTextW(hwnd, buff, length + 1)
+                title = buff.value.strip() or "active window"
+                WM_CLOSE = 0x0010
+                user32.PostMessageW(hwnd, WM_CLOSE, 0, 0)
+                return _finish("close_window", arguments, started_at, True, f"Closed {title}.")
+            else:
+                return _finish("close_window", arguments, started_at, False, "No active window detected to close.")
+        else:
+            return _finish("close_window", arguments, started_at, False, "Window closing is only supported on Windows.")
+    except Exception as error:
+        return _finish("close_window", arguments, started_at, False, f"Could not close active window: {error}")
+
+
+def close_app(app_name: str = "", **kwargs: Any) -> dict[str, Any]:
+    """Close a running application using psutil to find and terminate its processes."""
+    started_at = time.perf_counter()
+    target_app = (app_name or kwargs.get("name") or kwargs.get("target") or kwargs.get("app") or "").strip()
+    arguments = {"app_name": target_app}
+    try:
+        if not target_app:
+            return close_window()
+
+        clean_name = target_app.strip().lower()
+        if clean_name in {"window", "the window", "active window", "current window", "dirisha"}:
+            return close_window()
+        
+        # Map app names to process names
+        process_names = {
+            "chrome": "chrome.exe",
+            "google chrome": "chrome.exe",
+            "msedge": "msedge.exe",
+            "edge": "msedge.exe",
+            "microsoft edge": "msedge.exe",
+            "firefox": "firefox.exe",
+            "brave": "brave.exe",
+            "vscode": "Code.exe",
+            "code": "Code.exe",
+            "visual studio code": "Code.exe",
+            "vs code": "Code.exe",
+            "notepad": "notepad.exe",
+            "calculator": "calc.exe",
+            "calc": "calc.exe",
+            "word": "WINWORD.EXE",
+            "excel": "EXCEL.EXE",
+            "powerpoint": "POWERPNT.EXE",
+            "spotify": "Spotify.exe",
+            "discord": "Discord.exe",
+            "telegram": "Telegram.exe",
+            "whatsapp": "WhatsApp.exe",
+            "vlc": "vlc.exe",
+            "cmd": "cmd.exe",
+        }
+
+        # Get process name from mapping or use the input
+        target_process = process_names.get(clean_name)
+        if not target_process:
+            target_process = clean_name if clean_name.endswith(".exe") else f"{clean_name}.exe"
+
+        terminated_count = 0
+        for proc in psutil.process_iter(['pid', 'name']):
+            try:
+                if proc.info['name'] and proc.info['name'].lower() == target_process.lower():
+                    proc.terminate()
+                    terminated_count += 1
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+
+        if terminated_count > 0:
+            display_names = {
+                "vscode": "VS Code", "code": "VS Code", "visual studio code": "VS Code",
+                "msedge": "Microsoft Edge", "edge": "Microsoft Edge",
+                "chrome": "Google Chrome", "calc": "Calculator", "calculator": "Calculator",
+                "notepad": "Notepad", "word": "Word", "excel": "Excel", "spotify": "Spotify",
+                "cmd": "Command Prompt"
+            }
+            app_display = display_names.get(clean_name, target_app.title())
+            return _finish("close_app", arguments, started_at, True, f"Closed {app_display}.")
+        else:
+            return _finish("close_app", arguments, started_at, False, f"No running instances of '{target_app}' found to close.")
+    except Exception as error:
+        return _finish("close_app", arguments, started_at, False, f"Could not close {target_app}. {error}")
 
 
 def execute_tool(
@@ -786,22 +1107,45 @@ def execute_tool(
             return system_info()
         if tool == "installed_tools":
             return installed_tools()
+        if tool == "installed_apps":
+            return installed_apps()
         if tool == "search_file":
-            return search_file(**arguments)
+            query_name = (
+                arguments.get("name")
+                or arguments.get("file_name")
+                or arguments.get("filename")
+                or arguments.get("query")
+                or arguments.get("pattern")
+                or arguments.get("search_term")
+                or ""
+            )
+            target_path = arguments.get("path")
+            limit = arguments.get("limit", 50)
+            return search_file(name=query_name, path=target_path, limit=limit)
         if tool == "workspace_info":
             return workspace_info()
         if tool == "frontend_build":
             return frontend_build(**arguments)
         if tool == "launch_app":
-            result = launch_app(**arguments)
-            # If successful, learn the path for future use
+            app = arguments.get("app_name") or arguments.get("name") or arguments.get("target") or ""
+            result = launch_app(app_name=app)
             if result["success"] and "target_path" in str(result.get("output", "")):
-                # Extract path from output and learn it
-                import re
                 path_match = re.search(r'[A-Z]:\\[^"]+\.exe', result["output"])
                 if path_match:
-                    _learn_path(arguments.get("app_name", ""), path_match.group(0))
+                    _learn_path(app, path_match.group(0))
             return result
+        if tool == "close_window":
+            return close_window(**arguments)
+        if tool == "close_app":
+            return close_app(**arguments)
+        if tool == "write_file":
+            file_path = arguments.get("path") or arguments.get("file_path") or arguments.get("filename") or arguments.get("name") or ""
+            content = arguments.get("content") or arguments.get("code") or arguments.get("text") or arguments.get("body") or ""
+            return write_file(path=file_path, content=content, **{k: v for k, v in arguments.items() if k not in ("path", "content")})
+        if tool == "run_command":
+            cmd = arguments.get("command") or arguments.get("cmd") or arguments.get("shell") or arguments.get("script") or ""
+            cwd = arguments.get("path")
+            return run_command(command=cmd, path=cwd)
     except TypeError as error:
         return {
             "success": False,
