@@ -357,17 +357,52 @@ def parse_local_command(prompt: str, language: str = "en") -> str | None:
             return "Karibu sana Samson! Kuna lingine la kukusaidia? | You are very welcome Samson! Is there anything else I can help you with?"
 
     # 7. Identity & Boss / Creator queries (instant 0ms response, zero hallucination)
+    samson_triggers = [
+        "who is samson", "who's samson", "who is samson mwamloso", "who is mwamloso",
+        "tell me about samson", "samson ni nani", "nani samson", "samson ni nani kwako"
+    ]
+    if any(trig in clean_prompt for trig in samson_triggers):
+        if language == "en":
+            return "Samson Mwamloso is my creator, engineer, and boss. He is the developer and owner of Nyota Assistant. | Samson Mwamloso is my creator, engineer, and boss. He is the developer and owner of Nyota Assistant."
+        return "Samson Mwamloso ndiye bosi, mhandisi, na muundaji wangu mkuu. Yeye ndiye mmiliki na mtengenezaji wa mfumo wa Nyota Assistant! | Samson Mwamloso is my creator, engineer, and boss. He is the developer and owner of Nyota Assistant."
+
     identity_triggers = [
         "who is your boss", "who's your boss", "who is your creator", "who created you",
-        "who made you", "who built you", "who owns you", "what is your name",
-        "who are you", "who are u", "tell me about yourself",
-        "wewe ni nani", "bosi wako ni nani", "nani bosi wako", "bosi wako",
+        "who made you", "who built you", "who owns you", "who is your owner", "who's your owner",
+        "what is your name", "who are you", "who are u", "tell me about yourself",
+        "wewe ni nani", "bosi wako ni nani", "nani bosi wako", "bosi wako", "mmiliki wako",
         "nani aliyekuunda", "nani alikutengeneza", "jina lako nani", "wewe nani"
     ]
     if any(trig in clean_prompt for trig in identity_triggers):
         if language == "en":
             return "I am Nyota, an autonomous AI assistant built specifically for Samson Mwamloso. Samson is my boss and creator. | I am Nyota, an autonomous AI assistant built specifically for Samson Mwamloso. Samson is my boss and creator."
         return "Mimi ni Nyota, msaidizi wako wa AI niliyetengenezwa maalum kwa ajili ya Samson Mwamloso. Samson ndiye bosi na muundaji wangu! | I am Nyota, an autonomous AI assistant built specifically for Samson Mwamloso. Samson is my boss and creator."
+
+    # 7b. Security Inspection fast-path
+    sec_triggers = [
+        "inspect security", "security status", "ecurity sttus", "ecurity status", "security check",
+        "check security", "inspect the security", "inspect security status", "hali ya usalama", "hali ya ulinzi"
+    ]
+    if any(t in clean_prompt for t in sec_triggers):
+        from .executor import execute_tool
+        res = execute_tool("security_status", {})
+        out = res.get("output", "")
+        if out:
+            if language == "en":
+                return f"{out} | {out}"
+            return f"Ripoti ya Usalama: {out} | {out}"
+
+    # 7c. Camera fast-path
+    if any(k in clean_prompt for k in ["please camera for me", "open camera", "launch camera", "start camera", "washa camera", "fungua camera"]):
+        from .executor import execute_tool
+        res = execute_tool("launch_app", {"app_name": "camera"}, approved=True)
+        out = res.get("output", "Opening Camera.")
+        return f"{out} | {out}"
+    if any(k in clean_prompt for k in ["close camera", "funga camera", "shut down camera", "zima camera", "kill camera"]):
+        from .executor import execute_tool
+        res = execute_tool("close_app", {"app_name": "camera"}, approved=True)
+        out = res.get("output", "Closed Camera.")
+        return f"{out} | {out}"
 
     # 8. Installed Programs / Applications queries (instant 0ms response, zero token loops)
     app_query_words = ["program", "programu", "app", "application", "software"]

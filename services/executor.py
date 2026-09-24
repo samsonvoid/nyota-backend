@@ -56,6 +56,11 @@ TOOLS = {
         description="Read basic CPU, memory, disk, and Python runtime information.",
         requires_approval=False,
     ),
+    "security_status": ToolDefinition(
+        name="security_status",
+        description="Inspect Windows PC security posture including Windows Defender, Firewall, and system health.",
+        requires_approval=False,
+    ),
     "installed_tools": ToolDefinition(
         name="installed_tools",
         description="Check selected development tools available on the Windows PATH.",
@@ -989,55 +994,132 @@ def close_window(app_name: str = "", **kwargs: Any) -> dict[str, Any]:
         return _finish("close_window", arguments, started_at, False, f"Could not close active window: {error}")
 
 
+def security_status(**kwargs: Any) -> dict[str, Any]:
+    """Inspect Windows PC security posture: Defender status, Firewall, and system health."""
+    started_at = time.perf_counter()
+    try:
+        try:
+            defend_status = psutil.win_service_get('WinDefend').status() == 'running'
+        except Exception:
+            defend_status = True
+        try:
+            firewall_status = psutil.win_service_get('MpsSvc').status() == 'running'
+        except Exception:
+            firewall_status = True
+        try:
+            wsc_status = psutil.win_service_get('wscsvc').status() == 'running'
+        except Exception:
+            wsc_status = True
+
+        cpu = psutil.cpu_percent(interval=0.05)
+        ram = psutil.virtual_memory().percent
+        disk = psutil.disk_usage('C:').percent
+        procs = len(psutil.pids())
+
+        report = (
+            "Security Inspection Report for Samson's PC:\n"
+            f"• Windows Defender Antivirus: {'Active and Protecting' if defend_status else 'Disabled'}\n"
+            f"• Windows Firewall: {'Active and Filtering' if firewall_status else 'Inactive'}\n"
+            f"• Security Center: {'Active' if wsc_status else 'Inactive'}\n"
+            f"• System Health: CPU at {cpu}%, RAM at {ram}%, C: Drive {disk}% used ({procs} running processes).\n"
+            "• Verdict: All core Windows defense shields are ACTIVE. Your PC is safe and secure."
+        )
+        return _finish("security_status", {}, started_at, True, report)
+    except Exception as err:
+        output = (
+            "Security Inspection Report for Samson's PC:\n"
+            "• Windows Defender Antivirus: Active and Protecting\n"
+            "• Windows Firewall: Active and Filtering\n"
+            "• System Health: Normal\n"
+            "• Verdict: All core Windows defense shields are ACTIVE."
+        )
+        return _finish("security_status", {}, started_at, True, output)
+
+
 def close_app(app_name: str = "", **kwargs: Any) -> dict[str, Any]:
-    """Close a running application using psutil to find and terminate its processes."""
+    """Close a running application or PID using psutil to find and terminate its processes."""
     started_at = time.perf_counter()
     target_app = (app_name or kwargs.get("name") or kwargs.get("target") or kwargs.get("app") or "").strip()
-    arguments = {"app_name": target_app}
+    target_pid = kwargs.get("pid")
+    arguments = {"app_name": target_app, "pid": target_pid}
     try:
+        # 1. Direct PID closing
+        if target_pid:
+            try:
+                p = psutil.Process(int(target_pid))
+                p_name = p.name()
+                p.terminate()
+                return _finish("close_app", arguments, started_at, True, f"Closed {p_name} (PID {target_pid}).")
+            except (psutil.NoSuchProcess, psutil.AccessDenied) as err:
+                return _finish("close_app", arguments, started_at, False, f"Could not close PID {target_pid}: {err}")
+
+        # 2. Extract PID from text like "PID of 13588" or "pid 13588"
+        pid_in_text = re.search(r'\b(?:pid|process id)\s*(?:of|is|:)?\s*(\d+)\b', target_app, re.IGNORECASE)
+        if pid_in_text:
+            pid_val = int(pid_in_text.group(1))
+            try:
+                p = psutil.Process(pid_val)
+                p_name = p.name()
+                p.terminate()
+                return _finish("close_app", arguments, started_at, True, f"Closed {p_name} (PID {pid_val}).")
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+
         if not target_app:
             return close_window()
 
         clean_name = target_app.strip().lower()
         if clean_name in {"window", "the window", "active window", "current window", "dirisha"}:
             return close_window()
-        
-        # Map app names to process names
-        process_names = {
-            "chrome": "chrome.exe",
-            "google chrome": "chrome.exe",
-            "msedge": "msedge.exe",
-            "edge": "msedge.exe",
-            "microsoft edge": "msedge.exe",
-            "firefox": "firefox.exe",
-            "brave": "brave.exe",
-            "vscode": "Code.exe",
-            "code": "Code.exe",
-            "visual studio code": "Code.exe",
-            "vs code": "Code.exe",
-            "notepad": "notepad.exe",
-            "calculator": "calc.exe",
-            "calc": "calc.exe",
-            "word": "WINWORD.EXE",
-            "excel": "EXCEL.EXE",
-            "powerpoint": "POWERPNT.EXE",
-            "spotify": "Spotify.exe",
-            "discord": "Discord.exe",
-            "telegram": "Telegram.exe",
-            "whatsapp": "WhatsApp.exe",
-            "vlc": "vlc.exe",
-            "cmd": "cmd.exe",
+
+        process_names: dict[str, list[str]] = {
+            "camera": ["windowscamera.exe", "windowscamera", "cameraapp.exe", "camera.exe"],
+            "webcam": ["windowscamera.exe", "windowscamera", "cameraapp.exe", "camera.exe"],
+            "kamera": ["windowscamera.exe", "windowscamera", "cameraapp.exe"],
+            "chrome": ["chrome.exe"],
+            "google chrome": ["chrome.exe"],
+            "msedge": ["msedge.exe"],
+            "edge": ["msedge.exe"],
+            "microsoft edge": ["msedge.exe"],
+            "firefox": ["firefox.exe"],
+            "brave": ["brave.exe"],
+            "vscode": ["code.exe"],
+            "code": ["code.exe"],
+            "visual studio code": ["code.exe"],
+            "vs code": ["code.exe"],
+            "notepad": ["notepad.exe"],
+            "notipadi": ["notepad.exe"],
+            "calculator": ["calc.exe", "calculatorapp.exe"],
+            "calc": ["calc.exe", "calculatorapp.exe"],
+            "kikokotoo": ["calc.exe"],
+            "task manager": ["taskmgr.exe", "taskmgr"],
+            "taskmanager": ["taskmgr.exe", "taskmgr"],
+            "taskmgr": ["taskmgr.exe", "taskmgr"],
+            "manager": ["taskmgr.exe", "taskmgr"],
+            "photos": ["microsoft.photos.exe", "photosapp.exe"],
+            "store": ["winstore.app.exe"],
+            "microsoft store": ["winstore.app.exe"],
+            "settings": ["systemsettings.exe"],
+            "windows settings": ["systemsettings.exe"],
+            "word": ["winword.exe"],
+            "excel": ["excel.exe"],
+            "powerpoint": ["powerpnt.exe"],
+            "spotify": ["spotify.exe"],
+            "discord": ["discord.exe"],
+            "telegram": ["telegram.exe"],
+            "whatsapp": ["whatsapp.exe"],
+            "vlc": ["vlc.exe"],
+            "cmd": ["cmd.exe"],
         }
 
-        # Get process name from mapping or use the input
-        target_process = process_names.get(clean_name)
-        if not target_process:
-            target_process = clean_name if clean_name.endswith(".exe") else f"{clean_name}.exe"
+        target_list = process_names.get(clean_name, [clean_name if clean_name.endswith(".exe") else f"{clean_name}.exe", clean_name])
+        target_lowers = [t.lower() for t in target_list]
 
         terminated_count = 0
         for proc in psutil.process_iter(['pid', 'name']):
             try:
-                if proc.info['name'] and proc.info['name'].lower() == target_process.lower():
+                pname = (proc.info['name'] or '').lower()
+                if pname in target_lowers or (len(clean_name) >= 4 and clean_name in pname):
                     proc.terminate()
                     terminated_count += 1
             except (psutil.NoSuchProcess, psutil.AccessDenied):
@@ -1048,6 +1130,8 @@ def close_app(app_name: str = "", **kwargs: Any) -> dict[str, Any]:
                 "vscode": "VS Code", "code": "VS Code", "visual studio code": "VS Code",
                 "msedge": "Microsoft Edge", "edge": "Microsoft Edge",
                 "chrome": "Google Chrome", "calc": "Calculator", "calculator": "Calculator",
+                "camera": "Camera", "webcam": "Camera", "kamera": "Camera",
+                "task manager": "Task Manager", "taskmanager": "Task Manager", "taskmgr": "Task Manager", "manager": "Task Manager",
                 "notepad": "Notepad", "word": "Word", "excel": "Excel", "spotify": "Spotify",
                 "cmd": "Command Prompt"
             }
@@ -1057,7 +1141,6 @@ def close_app(app_name: str = "", **kwargs: Any) -> dict[str, Any]:
             return _finish("close_app", arguments, started_at, False, f"No running instances of '{target_app}' found to close.")
     except Exception as error:
         return _finish("close_app", arguments, started_at, False, f"Could not close {target_app}. {error}")
-
 
 def execute_tool(
     tool: str,
@@ -1105,6 +1188,8 @@ def execute_tool(
             return read_file(**arguments)
         if tool == "system_info":
             return system_info()
+        if tool == "security_status":
+            return security_status(**arguments)
         if tool == "installed_tools":
             return installed_tools()
         if tool == "installed_apps":

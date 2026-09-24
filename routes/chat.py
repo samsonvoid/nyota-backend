@@ -2,12 +2,10 @@ import os
 import json
 import re
 import tempfile
-import wave
 import asyncio
 import time
 import ollama
 import pyaudio
-import pyttsx3
 import threading
 from typing import Any
 from dataclasses import dataclass
@@ -19,13 +17,31 @@ from services.gemini_service import model, query_nyota, parse_local_command
 from services.executor import available_tools, execute_tool
 from services.approvals import approval_store
 from services.memory import memory_context
+from services.tts import nyota_tts, speak_async
 
 router = APIRouter(prefix="/api", tags=["chat"])
 
+tts_engine = nyota_tts
 
-active_tts_engine = None
-active_tts_speaking = False
-active_tts_lock = threading.Lock()
+def check_mode_change(text: str) -> str | None:
+    text_lower = text.lower().strip()
+    natural_keywords = [
+        "switch to premium voice", "use premium voice", "premium voice", "switch to premium",
+        "switch to natural voice", "use natural voice", "natural voice", "switch to natural",
+        "use neural voice", "switch to neural", "neural voice", "speak in natural mode", "speak in premium mode",
+        "badili sauti kuwa ya asili", "tumia sauti ya asili", "sauti ya asili"
+    ]
+    fast_keywords = [
+        "switch to fast voice", "use fast voice", "fast voice", "switch to fast",
+        "switch to standard voice", "use standard voice", "standard voice", "switch to standard",
+        "switch to sapi5", "use sapi5", "sapi5 voice", "speak in fast mode", "speak in standard mode",
+        "badili sauti kuwa ya haraka", "tumia sauti ya haraka", "sauti ya haraka"
+    ]
+    if any(k in text_lower for k in natural_keywords):
+        return tts_engine.set_mode("natural")
+    elif any(k in text_lower for k in fast_keywords):
+        return tts_engine.set_mode("fast")
+    return None
 
 
 class ChatRequest(BaseModel):
@@ -62,11 +78,18 @@ class LocalQueryResult:
     approval_id: str | None = None
 
 def _extract_launch_app(message: str) -> str | None:
-    """Detect direct app launch requests like 'open msedge', 'launch chrome', 'fungua vscode', 'play music'."""
+    """Detect direct app launch requests like 'open msedge', 'please camera for me', 'launch chrome', 'fungua vscode', 'play music'."""
     clean = message.strip().lower()
     clean = re.sub(r'[?!.,;:_#@*()\-+]', ' ', clean).strip()
 
-    if clean in {"play music", "play some music", "play song", "play songs", "cheza muziki", "open music", "open spotify"}:
+    # Strip conversational prefixes/suffixes
+    clean = re.sub(r'^(?:please|can you|could you|help me|kindly|tafadhali|naomba)\s+', '', clean).strip()
+    clean = re.sub(r'\s+(?:for me|please|now|haraka|sasa)$', '', clean).strip()
+
+    if clean in {"camera", "the camera", "webcam", "video camera", "kamera"}:
+        return "camera"
+
+    if clean in {"play music", "play some music", "play song", "play songs", "cheza muziki", "open music", "open spotify", "music", "spotify"}:
         return "music"
 
     match = re.match(
@@ -82,18 +105,32 @@ def _extract_launch_app(message: str) -> str | None:
             return "explorer"
         if target in {"music", "song", "songs", "muziki"}:
             return "music"
+        if target in {"camera", "the camera", "webcam", "video camera", "kamera"}:
+            return "camera"
         if target and len(target.split()) <= 3 and target not in non_apps:
             return target
     return None
 
 
 def _extract_close_app(message: str) -> tuple[str, dict[str, Any]] | None:
-    """Detect direct app/window close requests like 'close window', 'close edge', 'funga chrome'."""
+    """Detect direct app/window close requests like 'close window', 'close edge', 'close camera', 'funga chrome'."""
     clean = message.strip().lower()
     clean = re.sub(r'[?!.,;:_#@*()\-+]', ' ', clean).strip()
 
-    if clean in {"close window", "close the window", "close active window", "close current window", "funga dirisha", "funga window", "close it"}:
+    # Check for PID specification e.g. "PID of 13588" or "pid 13588"
+    pid_match = re.search(r'\b(?:pid|process id)\s*(?:of|is|:)?\s*(\d+)\b', clean)
+    if pid_match and any(w in clean for w in ["close", "kill", "terminate", "funga", "zima", "shut down"]):
+        return ("close_app", {"pid": int(pid_match.group(1))})
+
+    # Strip conversational prefixes/suffixes
+    clean = re.sub(r'^(?:please|can you|could you|help me|kindly|tafadhali|naomba)\s+', '', clean).strip()
+    clean = re.sub(r'\s+(?:for me|please|now|haraka|sasa)$', '', clean).strip()
+
+    if clean in {"close window", "close the window", "close active window", "close current window", "funga dirisha", "funga window", "close it", "funga hii"}:
         return ("close_window", {})
+
+    if clean in {"close camera", "funga camera", "zima camera", "kill camera", "close webcam"}:
+        return ("close_app", {"app_name": "camera"})
 
     match = re.match(
         r'^(?:close|exit|terminate|kill|shut down|funga|zima)\s+([a-zA-Z0-9_\- ]+)$',
@@ -103,6 +140,8 @@ def _extract_close_app(message: str) -> tuple[str, dict[str, Any]] | None:
         target = match.group(1).strip()
         if target in {"window", "the window", "active window", "current window", "dirisha"}:
             return ("close_window", {})
+        if target in {"camera", "the camera", "webcam", "kamera"}:
+            return ("close_app", {"app_name": "camera"})
         if target and len(target.split()) <= 3:
             return ("close_app", {"app_name": target})
     return None
@@ -130,7 +169,16 @@ def _check_direct_tool(message: str) -> str | None:
         res = execute_tool("installed_tools", {})
         return res.get("output", "Could not query installed tools.")
 
-    # 3. Check for system hardware stats
+    # 3. Check for system security status
+    sec_keywords = [
+        "security status", "ecurity sttus", "ecurity status", "inspect security", "check security",
+        "security report", "inspect the security", "hali ya usalama", "hali ya ulinzi", "defender", "antivirus"
+    ]
+    if any(kw in clean for kw in sec_keywords):
+        res = execute_tool("security_status", {})
+        return res.get("output", "Could not query security status.")
+
+    # 4. Check for system hardware stats
     sys_keywords = ["system info", "system status", "pc info", "hardware info", "hali ya kompyuta"]
     if any(kw in clean for kw in sys_keywords):
         res = execute_tool("system_info", {})
@@ -175,7 +223,7 @@ def query_ollama_local(message: str, language: str = "en") -> LocalQueryResult |
 
         sys_prompt = (
             "You are Nyota, an autonomous AI assistant built specifically for Samson Mwamloso running directly on his Windows PC.\n"
-            "Samson Mwamloso is your creator, engineer, and boss. You were NOT created by OpenAI, Microsoft, or Google. NEVER say you were created by OpenAI.\n"
+            "Samson Mwamloso is your creator, engineer, and boss. When asked who Samson is, state clearly that Samson Mwamloso is your creator, engineer, and boss. NEVER refer to the user in third person or say 'your creator' when talking to Samson. You were NOT created by OpenAI, Microsoft, or Google.\n"
             "You have REAL tools that execute on this computer. NEVER say 'as an AI I don't have access' — "
             "you DO have access through your tools.\n"
             "NEVER refuse a coding, scripting, or file request — use write_file to save scripts to disk.\n\n"
@@ -187,6 +235,8 @@ def query_ollama_local(message: str, language: str = "en") -> LocalQueryResult |
             '{"action":"execute","tool":"close_app","arguments":{"app_name":"<app>"}}\n\n'
             "Tool: close_window — close the currently active/foreground window\n"
             '{"action":"execute","tool":"close_window","arguments":{}}\n\n'
+            "Tool: security_status — inspect PC security, Windows Defender, Firewall, and system health\n"
+            '{"action":"execute","tool":"security_status","arguments":{}}\n\n'
             "Tool: installed_apps — list installed desktop programs and apps on Samson's PC\n"
             '{"action":"execute","tool":"installed_apps","arguments":{}}\n\n'
             "Tool: search_file — find files by name inside workspace folders\n"
@@ -417,39 +467,12 @@ def _sanitize_for_voice(text: str) -> str:
     return clean
 
 
-def speak_async(text: str):
-    global active_tts_engine, active_tts_speaking
-    try:
-        if "|" in text:
-            text_to_speak = text.split("|")[1].strip()
-        else:
-            text_to_speak = text.strip()
-
-        text_to_speak = _sanitize_for_voice(text_to_speak)
-        if not text_to_speak:
-            return
-
-        with active_tts_lock:
-            active_tts_speaking = True
-
-        # Re-initialize pyttsx3 inside the thread
-        engine = pyttsx3.init()
-        voices = engine.getProperty('voices')
-        if voices:
-            engine.setProperty('voice', voices[0].id)
-        engine.setProperty('rate', 155)
-        
-        with active_tts_lock:
-            active_tts_engine = engine
-            
-        engine.say(text_to_speak)
-        engine.runAndWait()
-    except Exception as e:
-        print(f"Background TTS Speech error: {e}")
-    finally:
-        with active_tts_lock:
-            active_tts_engine = None
-            active_tts_speaking = False
+def speak_async(text: str, language: str = "en"):
+    threading.Thread(
+        target=tts_engine.speak,
+        args=(text, language),
+        daemon=True
+    ).start()
 
 
 def persist_messages(conversation_id: str, user_message: str, assistant_message: str):
@@ -496,26 +519,14 @@ def persist_messages(conversation_id: str, user_message: str, assistant_message:
 
 @router.get("/tts-status")
 def get_tts_status(_=Depends(validate_api_key)):
-    global active_tts_speaking
-    with active_tts_lock:
-        speaking = active_tts_speaking
-    return {"is_speaking": speaking}
+    return {"is_speaking": tts_engine.is_speaking()}
 
 
 @router.post("/interrupt")
 def interrupt_speech(_=Depends(validate_api_key)):
-    global active_tts_engine, active_tts_speaking
-    with active_tts_lock:
-        active_tts_speaking = False
-        if active_tts_engine:
-            try:
-                active_tts_engine.stop()
-                print("[TTS]: Speech interrupted by user request.")
-                return {"status": "interrupted"}
-            except Exception as e:
-                print(f"[TTS]: Failed to interrupt speech: {e}")
-                return {"status": "error", "detail": str(e)}
-    return {"status": "idle"}
+    tts_engine.interrupt()
+    print("[TTS]: Speech interrupted by user request.")
+    return {"status": "interrupted"}
 
 
 @router.post("/chat", response_model=ChatResponse)
@@ -523,6 +534,16 @@ def interrupt_speech(_=Depends(validate_api_key)):
 async def chat(request: Request, body: ChatRequest, _=Depends(validate_api_key)):
     if not body.message.strip():
         raise HTTPException(status_code=400, detail="Message cannot be empty")
+
+    mode_result = check_mode_change(body.message)
+    if mode_result:
+        speak_async(mode_result, language="en")
+        return ChatResponse(
+            reply=mode_result,
+            conversation_id=body.conversation_id or "new-conversation-id",
+            approval_id=None,
+            approval_status=None,
+        )
 
     approval_id = None
     try:
@@ -568,7 +589,7 @@ async def chat(request: Request, body: ChatRequest, _=Depends(validate_api_key))
         daemon=True,
     ).start()
 
-    threading.Thread(target=speak_async, args=(reply,), daemon=True).start()
+    speak_async(reply, language)
 
     return ChatResponse(
         reply=reply,
@@ -764,6 +785,17 @@ def voice_chat(request: Request, body: VoiceChatRequest, _=Depends(validate_api_
                     is_silence=True
                 )
 
+        # Check for mode change via voice
+        mode_result = check_mode_change(user_query)
+        if mode_result:
+            threading.Thread(target=speak_async, args=(mode_result,), daemon=True).start()
+            return VoiceChatResponse(
+                user_query=user_query,
+                reply=mode_result,
+                conversation_id=body.conversation_id or "new-conversation-id",
+                is_silence=False
+            )
+
         # 1. Direct tool execution via executor.py for voice launch, close & tool requests
         target_app = _extract_launch_app(user_query)
         target_close = _extract_close_app(user_query)
@@ -805,7 +837,7 @@ def voice_chat(request: Request, body: VoiceChatRequest, _=Depends(validate_api_
         if os.path.exists(temp_wav_path):
             os.remove(temp_wav_path)
 
-    threading.Thread(target=speak_async, args=(reply,), daemon=True).start()
+    speak_async(reply, lang)
 
     conv_id = body.conversation_id or "f8a49c95-3bc4-4161-b51c-4b53cb12c3e1"
     threading.Thread(
@@ -823,4 +855,12 @@ def voice_chat(request: Request, body: VoiceChatRequest, _=Depends(validate_api_
         approval_id=approval_id,
         approval_status="pending" if approval_id else None,
     )
+
+
+@router.post("/voice-mode")
+async def voice_mode_switch(body: dict):
+    """Switch TTS engine mode via API (for frontend UI button)"""
+    mode = body.get("mode", "standard")
+    result = tts_engine.set_mode(mode)
+    return {"status": "ok", "mode": tts_engine.get_mode(), "message": result}
 
